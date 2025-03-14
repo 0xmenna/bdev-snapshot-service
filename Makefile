@@ -1,5 +1,5 @@
 obj-m += the_bdev_snapshot.o
-the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o
+the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o lib/snapshot.o lib/scinstall.o
 
 # Kernel build variables
 KDIR := /lib/modules/$(shell uname -r)/build
@@ -67,11 +67,12 @@ clean:
 	$(call clean_module,.)
 	$(call clean_module,usctm)
 	$(call clean_module,tests/singlefile_fs)
+	rm -rf usctm
 	rm tests/singlefile_fs/singlefilemakefs
 
 mount: mount_usctm mount_bdev_snapshot mount_testing_fs
 
-unmount: unmount_bdev_snapshot unmount_usctm unmount_testing_fs
+unmount: unmount_bdev_snapshot unmount_testing_fs unmount_usctm
 
 mount_usctm:
 	$(call ins_module,usctm)
