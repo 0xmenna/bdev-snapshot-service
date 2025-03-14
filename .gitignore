@@ -1,0 +1,55 @@
+# Ignore build artifacts
+*.o
+*.ko
+*.mod.c
+*.symvers
+*.order
+*.mod
+*.cmd
+
+# Ignore backup files
+*~
+.*.swp
+*.bak
+*.tmp
+
+# Ignore object and intermediate files
+*.d
+*.lst
+*.i
+*.s
+*.out
+
+# Ignore kernel build output directories
+*.tmp_versions/
+Module.symvers
+modules.order
+
+# Ignore patches and quilt files
+patches
+series
+
+# Ignore logs
+*.log
+
+# Ignore cscope and tags files
+cscope.*
+tags
+TAGS
+
+# Ignore editor-specific files
+.vscode/
+.idea/
+*.iml
+*.user
+*.project
+.DS_Store
+*.pyc
+__pycache__/
+
+.vscode/
+
+# Project related
+usctm/
+tests/singlefile_fs/image
+tests/singlefile_fs/singlefilemakefs
