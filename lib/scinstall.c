@@ -33,6 +33,7 @@
 
 static unsigned long the_ni_syscall;
 
+// Define two entries for the snapshot APIs
 static unsigned long new_sys_call_array[] = {0x0, 0x0};
 #define HACKED_ENTRIES (int)(sizeof(new_sys_call_array) / sizeof(unsigned long))
 static int restore[HACKED_ENTRIES] = {[0 ...(HACKED_ENTRIES - 1)] - 1};

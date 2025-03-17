@@ -24,7 +24,6 @@ static struct dentry_operations singlefilefs_dentry_ops = {
 };
 
 
-
 int singlefilefs_fill_super(struct super_block *sb, void *data, int silent) {   
 
     struct inode *root_inode;

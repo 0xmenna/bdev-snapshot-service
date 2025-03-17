@@ -1,7 +1,7 @@
 
-#ifndef SNAPSHOT_H
+#ifndef _SNAPSHOT_H_
 
-#define SNAPSHOT_H
+#define _SNAPSHOT_H_
 
 int activate_snapshot(char *dev_name, char *passwd);
 int deactivate_snapshot(char *dev_name, char *passwd);

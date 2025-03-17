@@ -21,7 +21,7 @@ int main(int argc, char ** argv){
 	 fd=open(argv[1],O_RDWR);
 	 if (fd == -1) {  
 		printf("file open error\n");
-	        exit(1);
+	      exit(1);
 	 }  
 
 	off = strtol(argv[3],NULL,10);
@@ -29,7 +29,7 @@ int main(int argc, char ** argv){
 	ret = lseek(fd,off,SEEK_SET);
 	if (ret == -1){
 		printf("seek error\n");
-	        exit(1);
+	      exit(1);
 	}
 
 	/* write up to BUFSIZE to destination file */ 

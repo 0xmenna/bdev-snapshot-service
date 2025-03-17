@@ -1,5 +1,5 @@
 obj-m += the_bdev_snapshot.o
-the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o lib/snapshot.o lib/scinstall.o
+the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o lib/snapshot.o lib/scinstall.o lib/utils.o lib/auth.o
 
 # Kernel build variables
 KDIR := /lib/modules/$(shell uname -r)/build
