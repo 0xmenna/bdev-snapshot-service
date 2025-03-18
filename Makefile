@@ -1,5 +1,5 @@
 obj-m += the_bdev_snapshot.o
-the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o lib/snapshot.o lib/scinstall.o lib/utils.o lib/auth.o
+the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o lib/snapshot.o lib/scinstall.o lib/utils.o lib/auth.o lib/snapshot.o
 
 # Kernel build variables
 KDIR := /lib/modules/$(shell uname -r)/build
@@ -7,6 +7,8 @@ PWD := $(shell pwd)
 
 # Linux syscall table discoverer repository information
 USCTM_REPO := https://github.com/0xmenna/usctm.git
+
+PASSWD_PATH = $(PWD)/the_snapshot_secret
 
 # -----------------------------------------------------------
 
@@ -22,7 +24,7 @@ define ins_module
 	@if [ "$1" = "usctm" ]; then \
 		sudo insmod usctm/the_usctm.ko; \
 	elif [ "$1" = "bdev_snapshot" ]; then \
-		sudo insmod the_bdev_snapshot.ko the_syscall_table=$$(sudo cat /sys/module/the_usctm/parameters/sys_call_table_address); \
+		sudo insmod the_bdev_snapshot.ko the_syscall_table=$$(sudo cat /sys/module/the_usctm/parameters/sys_call_table_address) the_snapshot_secret=$$(sudo cat $(PASSWD_PATH)); \
 	else \
 		sudo insmod tests/singlefile_fs/singlefilefs.ko; \
 	fi

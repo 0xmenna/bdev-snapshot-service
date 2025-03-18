@@ -10,7 +10,7 @@ int derive_sha256(const u8 *preimage, size_t preimage_len, u8 *out) {
    tfm = crypto_alloc_shash("sha256", 0, 0);
    if (IS_ERR(tfm)) {
       AUDIT log_info("Could not allocate message digest "
-                     "handle: %ld",
+                     "handle: %ld\n",
                      PTR_ERR(tfm));
 
       return PTR_ERR(tfm);
@@ -18,7 +18,7 @@ int derive_sha256(const u8 *preimage, size_t preimage_len, u8 *out) {
 
    desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
    if (!desc) {
-      AUDIT log_info("Could not allocate memory for shash_desc");
+      AUDIT log_info("Could not allocate memory for shash_desc\n");
       crypto_free_shash(tfm);
       return -ENOMEM;
    }

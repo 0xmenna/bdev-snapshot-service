@@ -70,7 +70,7 @@ bool snapshot_auth_verify(const char *passwd) {
 
    int ret = derive_passwd_hash(passwd, computed_hash);
    if (ret) {
-      AUDIT log_info("Password hash derivation was not executed succesfully");
+      AUDIT log_info("Password hash derivation was not executed succesfully\n");
       return -EINVAL;
    }
 

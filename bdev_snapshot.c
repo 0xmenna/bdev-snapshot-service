@@ -16,6 +16,7 @@
 
 #include "include/auth.h"
 #include "include/scinstall.h"
+#include "include/snapshot.h"
 #include "include/utils.h"
 
 #define MODNAME "BDEV_SNAPSHOT"
@@ -30,21 +31,25 @@ MODULE_PARM_DESC(the_syscall_table, "The syscall table address");
 
 static u8 the_snapshot_secret[SECRET_MAX_SIZE];
 module_param_string(the_snapshot_secret, the_snapshot_secret, SECRET_MAX_SIZE,
-                    0660);
+                    0);
 MODULE_PARM_DESC(the_snapshot_secret,
                  "The snapshot secret used for the authentication of the "
                  "snapshot service. As soon "
                  "as its digest is stored, it will be wiped out");
 
 static int __init bdev_snapshot_init(void) {
+   int ret;
    // Initialize the snapshot authentication subsystem
-   if (snapshot_auth_init(the_snapshot_secret)) {
-      AUDIT log_err(
-          "Failed to initialize the snapshot authentication subsystem");
+   ret = snapshot_auth_init(the_snapshot_secret);
+   if (ret) {
+      log_err("Failed to initialize the snapshot authentication subsystem\n");
       return -1;
    }
-   // Wipe the plain text secret
+   // Wipe the plain text password
    memzero_explicit(the_snapshot_secret, SECRET_MAX_SIZE);
+   AUDIT log_info(
+       "Snapshot authentication subsystem was initialized succesfully and "
+       "the plain-text password cleared out\n");
 
    // Install the snapshot service syscalls
    return install_syscalls(the_syscall_table);

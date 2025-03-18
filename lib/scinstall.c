@@ -26,6 +26,7 @@
 #include "../include/scinstall.h"
 #include "../include/scth.h"
 #include "../include/snapshot.h"
+#include "../include/utils.h"
 
 #define LIBNAME "SCINSTALL"
 
@@ -73,15 +74,11 @@ int install_syscalls(unsigned long the_syscall_table) {
    int ret;
 
    if (the_syscall_table == 0x0) {
-      printk("%s: cannot manage sys_call_table address set to 0x0\n",
-             THIS_MODULE->name);
+      log_info("Cannot manage sys_call_table address set to 0x0\n");
       return -1;
    }
 
-   AUDIT {
-      printk("%s: initializing - hacked entries %d\n", THIS_MODULE->name,
-             HACKED_ENTRIES);
-   }
+   AUDIT log_info("Initializing - hacked entries %d\n", HACKED_ENTRIES);
 
    new_sys_call_array[0] = (unsigned long)sys_activate_snapshot;
    new_sys_call_array[1] = (unsigned long)sys_deactivate_snapshot;
@@ -90,8 +87,7 @@ int install_syscalls(unsigned long the_syscall_table) {
                      (unsigned long *)the_syscall_table, &the_ni_syscall);
 
    if (ret != HACKED_ENTRIES) {
-      printk("%s: could not hack %d entries (just %d)\n", THIS_MODULE->name,
-             HACKED_ENTRIES, ret);
+      log_info("Could not hack %d entries (just %d)\n", HACKED_ENTRIES, ret);
 
       return -1;
    }
@@ -103,8 +99,7 @@ int install_syscalls(unsigned long the_syscall_table) {
    }
    protect_memory();
 
-   printk("%s: all new system-calls correctly installed on sys-call table\n",
-          THIS_MODULE->name);
+   log_info("All new system-calls correctly installed on sys-call table\n");
 
    return 0;
 }
@@ -112,7 +107,7 @@ int install_syscalls(unsigned long the_syscall_table) {
 void uninstall_syscalls(unsigned long the_syscall_table) {
    int i;
 
-   printk("%s: shutting down\n", THIS_MODULE->name);
+   log_info("Shutting down\n");
 
    unprotect_memory();
    for (i = 0; i < HACKED_ENTRIES; i++) {
@@ -120,6 +115,5 @@ void uninstall_syscalls(unsigned long the_syscall_table) {
    }
    protect_memory();
 
-   printk("%s: sys-call table restored to its original content\n",
-          THIS_MODULE->name);
+   log_info("sys-call table restored to its original content\n");
 }
