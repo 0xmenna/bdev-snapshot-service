@@ -13,7 +13,7 @@ int main(int argc, char ** argv){
 	int to_write;
 
 	 if (argc != 4) { /* check the number of arguments */ 
-		printf("usage: prog file-name content offset\n");
+		printf("usage:  file-namproge content offset\n");
 		exit(1);
 	 }  
 
