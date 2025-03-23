@@ -12,6 +12,7 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/kprobes.h>
 #include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -30,179 +31,352 @@
 #include <linux/version.h>
 #include <linux/wait.h>
 
+#include "../include/auth.h"
 #include "../include/snapshot.h"
 
 #define LIBNAME "SNAPSHOT"
 
 #define AUDIT if (1)
 
-#define COMMITTED_HASH_BITS 16
-#define HASH_BITS 8
+#define MAX_PATH 1024
+#define ASYNC
 
-/* Registered devices to the snapshot subsystem */
-static hregistered_devices devices[1 << HASH_BITS];
+// Global atomic counter for unique session IDs
+static atomic_t global_session_id;
 
-/* Per-CPU block log FIFO */
+// Global parent path for snapshot directories
+static struct path snapshot_root_path;
+
+// Registered devices to the snapshot subsystem
+static struct hlist_head devices[1 << HASH_BITS];
+// Locks for the registered devices
+static spinlock_t devices_lock[1 << HASH_BITS];
+
+// Per-CPU block log FIFO
 static DEFINE_PER_CPU(block_fifo, cpu_block_fifo);
 
-static inline bool is_path(const char *devname) {
-   return (strchr(devname, '/') != NULL);
-}
+static struct kretprobe rp_mount;
 
-static inline int get_device_by_name(const char *path, device_t *dev) {
-   struct path p;
-   int err;
-   char full_path[MAX_PATH];
+// Lookup of a snapshot device within the registered devices through RCU
+static snap_device *rcu_sdev_read_lock(dev_t lookup_dev) {
+      u32 hash = hash_dev(lookup_dev);
+      snap_device *sdev;
 
-   if (!is_path(path)) {
-      // "dev_name" is not a path: prepend /dev/ to the device name
-      if (strlen(path) >= MAX_DEV_NAME) {
-         AUDIT log_err("Device name too long\n");
-         return -ENAMETOOLONG;
+      rcu_read_lock();
+      hlist_for_each_entry_rcu(sdev, &devices[hash], hnode) {
+            if (d_num(sdev) == lookup_dev) {
+                  return sdev;
+            }
       }
 
-      strcpy(full_path, "/dev/");
-      strcat(full_path, path);
-   } else {
-      // "dev_name" is a path
-      if (strlen(path) >= MAX_PATH) {
-         AUDIT log_err("Device pathname too long\n");
-         return -ENAMETOOLONG;
+      return NULL;
+}
+
+// Unlock the RCU read lock
+static inline void rcu_sdev_read_unlock(void) { rcu_read_unlock(); }
+
+// Replaces a snapshot device within the registered devices through RCU
+static inline void rcu_replace_sdev(snap_device *old_sdev,
+                                    snap_device *new_sdev, u32 hash) {
+      spin_lock(&devices_lock[hash]);
+      hlist_replace_rcu(&old_sdev->hnode, &new_sdev->hnode);
+      spin_unlock(&devices_lock[hash]);
+}
+
+// Callback to free a snapshot device
+static void free_sdev_callback(struct rcu_head *rcu) {
+      snap_device *sdev = container_of(rcu, snap_device, rcu);
+      /**
+       * Why print preemt_count??
+       *
+       * To check whether this callback is atomic context or not.
+       * preempt_count here is more than 0. Because it is irq context.
+       */
+      log_info("Callback free: device : %s, preempt_count : %d\n",
+               sdev_name(sdev), preempt_count());
+      kfree(sdev);
+}
+
+// Computes a function on a snapshot device. It looks up the device by its
+// `dev_t` identifier and calls the function following RCU based "locking".
+static inline int rcu_compute_on_sdev(dev_t dev,
+                                      int (*compute_f)(snap_device *)) {
+      int ret;
+      snap_device *sdev = rcu_sdev_read_lock(dev);
+      if (!sdev) {
+            AUDIT log_err("Snapshot device not registered\n");
+            rcu_sdev_read_unlock();
+            return -NOSDEV;
       }
-      strcpy(full_path, path);
-   }
 
-   err = kern_path(full_path, LOOKUP_FOLLOW, &p);
-   if (err) {
-      AUDIT log_err("Failed to lookup %s: %d\n", full_path, err);
-      return err;
-   }
+      ret = compute_f(sdev);
+      if (ret == SDEVWRITE) {
+#ifdef ASYNC
+            call_rcu(&sdev->rcu, free_sdev_callback);
+#else
+            synchronize_rcu();
+            kfree(sdev);
+#endif
+            ret = 0;
+      }
+      rcu_sdev_read_unlock();
 
-   // Verify that the inode represents a block device
-   if (!S_ISBLK(p.dentry->d_inode->i_mode)) {
-      AUDIT log_err("%s is not a block device\n", full_path);
-      path_put(&p);
-      return -NODEV;
-   }
-
-   // Get a reference to the dentry
-   struct dentry *dentry = dget(p.dentry);
-   INIT_DEV(dev, dentry);
-
-   path_put(&p);
-
-   return 0;
+      return ret;
 }
 
-/**
- * try_init_snapdevice - Initializes a snap_device structure from a device
- * name.
- * @sdev: Pointer to the snap_device structure to initialize.
- * @dev_name: Name of the device to initialize.
- *
- * Returns 0 on success, or a negative error code.
- */
-static int try_init_snapdevice_by_name(char *dev_name, snap_device *sdev) {
-   struct path p;
-   int err;
-   device_t dev;
-   char full_path[MAX_PATH];
+// Add a snapshot device to the registered devices
+static void rcu_register_snapdevice(snap_device *sdev) {
+      u32 hash = hash_dev(d_num(sdev));
 
-   err = get_device_by_name(dev_name, &dev);
-   if (err) {
-      AUDIT log_err("Failed to get device by name: %d\n", err);
-      return err;
-   }
+      spin_lock(&devices_lock[hash]);
+      hlist_add_tail_rcu(&sdev->hnode, &devices[hash]);
+      spin_unlock(&devices_lock[hash]);
 
-   INIT_SNAP_DEVICE(sdev, dev);
-   AUDIT log_info("Snapshot device initialized succesfully\n");
-
-   return 0;
+      AUDIT log_info("Device %s registered\n", sdev_name(sdev));
 }
 
-static int init_snapshot_session(snapshot_session *snap_session, char *dev_name,
-                                 struct path *parent_path) {
-   struct tm tm;
-   char date_str[16]; // Format: YYYYMMDD_HHMMSS
-   char snap_subdirname[128];
-   char snap_dirname[128];
-   struct dentry *subdentry = NULL;
-   int ret = 0;
+// Remove a snapshot device from the registered devices
+static void rcu_unregister_snapdevice(snap_device *sdev, int async) {
+      u32 hash = hash_dev(d_num(sdev));
 
-   // Check that the device name is within allowed limits
-   if (strlen(dev_name) >= MAX_PATH) {
-      AUDIT log_err("Device name too long\n");
-      return -EINVAL;
-   }
+      spin_lock(&devices_lock[hash]);
+      hlist_del_rcu(&sdev->hnode);
+      spin_unlock(&devices_lock[hash]);
 
-   // Initialize session id and mount timestamp
-   snap_session->session_id = atomic_inc_return(&global_session_id);
-   snap_session->mount_timestamp = ktime_get_real_seconds();
+#ifdef ASYNC
+      call_rcu(&sdev->rcu, free_sdev_callback);
+#else
+      synchronize_rcu();
+      kfree(sdev);
+#endif
+      AUDIT log_info("Device %s unregistered. preempt_count: %d\n",
+                     sdev_name(sdev), preempt_count());
+}
 
-   // Format the timestamp into a date string: YYYYMMDD_HHMMSS
-   time64_to_tm(snap_session->mount_timestamp, 0, &tm);
-   snprintf(date_str, sizeof(date_str), "%04ld%02ld%02ld_%02ld%02ld%02ld",
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
-            tm.tm_sec);
+bool may_open_dev(const struct path *path) {
+      return !(path->mnt->mnt_flags & MNT_NODEV) &&
+             !(path->mnt->mnt_sb->s_iflags & SB_I_NODEV);
+}
 
-   // Build the snapshot subdirectory name: "<dev_name>_<date_str>"
-   snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%s", dev_name,
-            date_str);
+static int get_bdev_by_name(const char *pathname, device_t *dev) {
+      struct inode *inode;
+      struct path path;
+      int error;
 
-   // Construct the full snapshot directory path
-   snprintf(snap_dirname, sizeof(snap_dirname), "%s/%s",
-            parent_path->dentry->d_name.name, snap_subdirname);
+      if (!pathname || !*pathname)
+            return -EINVAL;
 
-   // Allocate a new dentry for the subdirectory
-   subdentry = d_alloc_name(parent_path->dentry, snap_subdirname);
-   if (!subdentry) {
-      AUDIT log_err("Failed to allocate dentry for %s\n", snap_subdirname);
-      return -ENOMEM;
-   }
+      error = kern_path(pathname, LOOKUP_FOLLOW, &path);
+      if (error) {
+            return error;
+      }
+      inode = d_backing_inode(path.dentry);
+      error = -ENOTBLK;
+      if (!S_ISBLK(inode->i_mode))
+            goto out_path_put;
 
-   // Create the new directory
-   ret = vfs_mkdir(parent_path->mnt->mnt_idmap, d_inode(parent_path->dentry),
-                   subdentry, 0600);
-   if (ret) {
-      AUDIT log_err("vfs_mkdir failed for %s: %d\n", snap_subdirname, ret);
-      goto out;
-   }
+      error = -EACCES;
+      if (!may_open_dev(&path))
+            goto out_path_put;
 
-   // Lookup the full path of the new directory
-   ret = kern_path(snap_dirname, LOOKUP_FOLLOW, &snap_session->snap_path);
-   if (ret) {
-      AUDIT log_err("Failed to lookup new directory %s: %d\n", snap_dirname,
-                    ret);
-      goto out;
-   }
+      // Get a reference to the dentry
+      struct dentry *dentry = dget(path.dentry);
+      INIT_DEV(dev, dentry);
+      error = 0;
+out_path_put:
+      path_put(&path);
+      return error;
+}
 
+static int try_init_snapdevice_by_name(const char *dev_name,
+                                       snap_device *sdev) {
+      device_t dev;
+      int err;
+
+      err = get_bdev_by_name(dev_name, &dev);
+      if (err) {
+            AUDIT log_err("Failed to get device by name: %d\n", err);
+            return err;
+      }
+
+      INIT_SNAP_DEVICE(sdev, dev);
+      AUDIT log_info("Snapshot device initialized succesfully\n");
+
+      return 0;
+}
+
+static int init_snapshot_session(snapshot_session *snap_session,
+                                 const char *dev_name) {
+      struct tm tm;
+      char date_str[16]; // Format: YYYYMMDD_HHMMSS
+      char snap_subdirname[128];
+      char snap_dirname[128];
+      struct dentry *subdentry = NULL;
+      int error;
+
+      // Initialize session id and mount timestamp
+      snap_session->session_id = atomic_inc_return(&global_session_id);
+      snap_session->mount_timestamp = ktime_get_real_seconds();
+
+      // Format the timestamp into a date string: YYYYMMDD_HHMMSS
+      time64_to_tm(snap_session->mount_timestamp, 0, &tm);
+      snprintf(date_str, sizeof(date_str), "%04ld%02ld%02ld_%02ld%02ld%02ld",
+               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+               tm.tm_min, tm.tm_sec);
+
+      // Build the snapshot subdirectory name: "<dev_name>_<date_str>"
+      snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%s", dev_name,
+               date_str);
+
+      // Construct the full snapshot directory path
+      snprintf(snap_dirname, sizeof(snap_dirname), "%s/%s",
+               snapshot_root_path.dentry->d_name.name, snap_subdirname);
+
+      // Allocate a new dentry for the subdirectory
+      subdentry = d_alloc_name(snapshot_root_path.dentry, snap_subdirname);
+      if (!subdentry) {
+            AUDIT log_err("Failed to allocate dentry for %s\n",
+                          snap_subdirname);
+            return -ENOMEM;
+      }
+
+      // Create the new directory
+      error = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
+                        d_inode(snapshot_root_path.dentry), subdentry, 0600);
+      if (error) {
+            AUDIT log_err("vfs_mkdir failed for %s: %d\n", snap_subdirname,
+                          error);
+            goto out;
+      }
+
+      // Lookup the full path of the new directory
+      error = kern_path(snap_dirname, LOOKUP_FOLLOW, &snap_session->snap_path);
+      if (error) {
+            AUDIT log_err("Failed to lookup new directory %s: %d\n",
+                          snap_dirname, error);
+            goto out;
+      }
+      error = 0;
 out:
-   dput(subdentry);
-   return ret;
+      dput(subdentry);
+      return error;
 }
 
-int activate_snapshot(char *dev_name, char *passwd) {
-   snap_device sdev;
-   int err;
-   dev_t devnum;
+// Allocate a new snapshot device if it is not already registered
+static int alloc_snapdevice(const char *dev_name) {
+      snap_device tmp_sdev, *sdev;
+      int error;
+      // Try to initialize the snapshot device
+      error = try_init_snapdevice_by_name(dev_name, &tmp_sdev);
+      if (error) {
+            AUDIT log_err("Failed to initialize snapshot device: %d\n", error);
+            return error;
+      }
+      // Check if the device is already registered
+      if (rcu_sdev_read_lock(&tmp_sdev) != NULL) {
+            AUDIT log_err("Device %s is already registered\n", dev_name);
 
-   // Check if the device is already registered
-   err = try_init_snapdevice_by_name(dev_name, &sdev);
-   if (err) {
-      AUDIT log_err("Failed to initialize snapshot device: %d\n", err);
-      return err;
-   }
+            rcu_sdev_read_unlock();
+            return -DEXIST;
+      }
+      rcu_sdev_read_unlock();
 
-   devnum = d_num(&sdev);
+      sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+      if (!sdev) {
+            AUDIT log_err("Failed to allocate memory for snap_device\n");
+            return -ENOMEM;
+      }
+      memcpy(sdev, &tmp_sdev, sizeof(snap_device));
 
-   return -1;
+      // Register the snapshot device
+      rcu_register_snapdevice(sdev);
+
+      return 0;
 }
 
-int deactivate_snapshot(char *dev_name, char *passwd) {
+static int create_new_session(snap_device *sdev) {
+      snap_device *old_sdev, *new_sdev;
+      snapshot_session *session;
+      int error;
 
-   AUDIT printk("%s: service not yet implemented\n", THIS_MODULE->name);
+      old_sdev = sdev;
+      new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+      if (!new_sdev) {
+            return -ENOMEM;
+      }
 
-   return -1;
+      memcpy(new_sdev, old_sdev, sizeof(snap_device));
+
+      session = kmalloc(sizeof(snapshot_session), GFP_KERNEL);
+      if (!session) {
+            kfree(new_sdev);
+            return -ENOMEM;
+      }
+
+      error = init_snapshot_session(session, sdev_name(sdev));
+      if (error) {
+            kfree(session);
+            kfree(new_sdev);
+            return error;
+      }
+      new_sdev->session = session;
+      AUDIT log_info("New snapshot session created for device: %s\n",
+                     sdev_name(sdev));
+
+      rcu_replace_sdev(old_sdev, new_sdev, hash_dev(d_num(new_sdev)));
+
+      return SDEVWRITE;
+}
+
+static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
+                                  struct pt_regs *regs) {
+      struct dentry *mnt_dentry;
+      dev_t dev;
+      snap_device *sdev;
+      int error;
+
+      // TODO: other kernel versions return a block_device
+      mnt_dentry = (struct dentry *)regs_return_value(regs);
+      if (IS_ERR(mnt_dentry))
+            goto ret_handler;
+
+      dev = mnt_dentry->d_sb->s_bdev->bd_dev;
+
+      error = rcu_compute_on_sdev(dev, create_new_session);
+      if (error) {
+            AUDIT log_err("Failed to create new session for device %d : %d\n",
+                          dev, error);
+            goto ret_handler;
+      }
+
+ret_handler:
+      return 0;
+}
+
+int activate_snapshot(const char *dev_name, const char *passwd) {
+      snap_device tmp_sdev, *sdev;
+      int error;
+
+      // Verifies password
+      if (!snapshot_auth_verify(passwd)) {
+            AUDIT log_err("Authentication failure for snapshot activation\n");
+            return -AUTHF;
+      }
+
+      // Tries to allocate a new snapshot device
+      error = alloc_snapdevice(dev_name);
+      if (error) {
+            AUDIT log_err("Failed to allocate snapshot device: %d\n", error);
+            return error;
+      }
+      return -1;
+}
+
+int deactivate_snapshot(const char *dev_name, const char *passwd) {
+
+      AUDIT printk("%s: service not yet implemented\n", THIS_MODULE->name);
+
+      return -1;
 }
 
 #endif
