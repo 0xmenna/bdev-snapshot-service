@@ -1,0 +1,9 @@
+dd if=/dev/zero of=disk.img bs=1M count=100
+mkfs.ext4 disk.img
+sudo losetup --find --show disk.img
+losetup -a
+sudo mount /dev/loop0 /tmp/mount
+
+
+sudo umount /tmp/mnt
+sudo losetup -d /dev/loop0

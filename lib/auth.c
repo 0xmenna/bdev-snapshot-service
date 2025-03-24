@@ -55,8 +55,10 @@ bool snapshot_auth_verify(const char *passwd) {
       u8 computed_hash[DIGEST_SIZE];
 
       // Verify priviledges
-      if (!capable(CAP_SYS_ADMIN))
+      if (!capable(CAP_SYS_ADMIN)) {
+            AUDIT log_err("Insufficient priviledges to verify the password\n");
             return false;
+      }
 
       int ret = derive_passwd_hash(passwd, computed_hash);
       if (ret) {

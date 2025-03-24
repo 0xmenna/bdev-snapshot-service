@@ -63,7 +63,6 @@ build_testing_fs:
 create_testing_fs:
 	dd bs=4096 count=100 if=/dev/zero of=tests/singlefile_fs/image
 	./tests/singlefile_fs/singlefilemakefs tests/singlefile_fs/image
-	mkdir /tmp/mount
 
 clean:
 	$(call clean_module,.)
@@ -83,6 +82,7 @@ mount_bdev_snapshot:
 	$(call ins_module,bdev_snapshot)
 
 mount_testing_fs:
+	mkdir /tmp/mount
 	$(call ins_module,singlefile_fs)
 	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image /tmp/mount/
 
@@ -94,5 +94,6 @@ unmount_bdev_snapshot:
 
 unmount_testing_fs:
 	sudo umount /tmp/mount/
+	rm -rf /tmp/mount
 	$(call rmm_module,tests/singlefile_fs/singlefilefs.ko)
 

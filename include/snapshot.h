@@ -161,6 +161,9 @@ typedef struct _block_fifo {
 int register_my_kretprobes(void);
 void unregister_my_kretprobes(void);
 
+int init_snapshot_path(void);
+void rm_snapshot_path(void);
+
 int activate_snapshot(const char *dev_name, const char *passwd);
 int deactivate_snapshot(const char *dev_name, const char *passwd);
 

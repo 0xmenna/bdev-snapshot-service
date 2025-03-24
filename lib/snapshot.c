@@ -126,7 +126,7 @@ static void rcu_register_snapdevice(snap_device *sdev) {
       hlist_add_tail_rcu(&sdev->hnode, &devices[hash]);
       spin_unlock(&devices_lock[hash]);
 
-      AUDIT log_info("Device %s registered\n", sdev_name(sdev));
+      log_info("New Device %s registered\n", sdev_name(sdev));
 }
 
 // Remove a snapshot device from the registered devices
@@ -182,12 +182,14 @@ static int try_init_snapdevice_by_name(const char *dev_name,
 
       err = get_bdev_by_name(dev_name, &dev);
       if (err) {
-            AUDIT log_err("Failed to get device by name: %d\n", err);
+            AUDIT log_err("Failed to get device %s by name: %d\n", dev_name,
+                          err);
             return err;
       }
 
       INIT_SNAP_DEVICE(sdev, dev);
-      AUDIT log_info("Snapshot device initialized succesfully\n");
+      AUDIT log_info("Snapshot device %s initialized succesfully\n",
+                     sdev_name(sdev));
 
       return 0;
 }
@@ -266,25 +268,61 @@ static int alloc_snapdevice(const char *dev_name) {
       // Try to initialize the snapshot device
       error = try_init_snapdevice_by_name(dev_name, &tmp_sdev);
       if (error) {
-            AUDIT log_err("Failed to initialize snapshot device: %d\n", error);
+            AUDIT log_err("Failed to initialize snapshot device %s: %d\n",
+                          dev_name, error);
             return error;
       }
       // Check if the snapshot device is already registered
       error = rcu_compute_on_sdev(d_num(&tmp_sdev), no_sdev);
       if (error) {
-            AUDIT log_err("Device %s is already registered\n", dev_name);
+            AUDIT log_err("Device %s is already registered\n",
+                          sdev_name(&tmp_sdev));
             return error;
       }
 
       sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
       if (!sdev) {
-            AUDIT log_err("Failed to allocate memory for snap_device\n");
+            AUDIT log_err("Failed to allocate memory for snapshot device %s\n",
+                          dev_name);
             return -ENOMEM;
       }
       memcpy(sdev, &tmp_sdev, sizeof(snap_device));
 
       // Register the snapshot device
       rcu_register_snapdevice(sdev);
+
+      return 0;
+}
+
+// Remove a snapshot device from the registered snapshot devices. It is
+// used as a callback for the `rcu_compute_on_sdev` function.
+static int remove_sdev(snap_device *sdev) {
+      if (!sdev) {
+            return -NOSDEV;
+      }
+      if (sdev->session) {
+            // Cannot remove snapshot device because it has an active session
+            return -SBUSY;
+      }
+      // Unregister the snapshot device
+      rcu_unregister_snapdevice(sdev);
+
+      // The free of `sdev` is demanded to the `rcu_compute_on_sdev` function
+      return SDEVREPLACE;
+}
+
+static int dealloc_snapdevice(const char *dev_name) {
+      snap_device sdev;
+      int error;
+
+      error = try_init_snapdevice_by_name(dev_name, &sdev);
+      if (error) {
+            return error;
+      }
+      error = rcu_compute_on_sdev(d_num(&sdev), remove_sdev);
+      if (error) {
+            return error;
+      }
 
       return 0;
 }
@@ -366,23 +404,6 @@ static struct kretprobe rp_mount = {
 
 static struct kretprobe *retprobes[] = {&rp_mount};
 
-// Remove a snapshot device from the registered snapshot devices. It is
-// used as a callback for the `rcu_compute_on_sdev` function.
-static int remove_sdev(snap_device *sdev) {
-      if (!sdev) {
-            return -NOSDEV;
-      }
-      if (sdev->session) {
-            // Cannot remove snapshot device because it has an active session
-            return -SBUSY;
-      }
-      // Unregister the snapshot device
-      rcu_unregister_snapdevice(sdev);
-
-      // The free of `sdev` is demanded to the `rcu_compute_on_sdev` function
-      return SDEVREPLACE;
-}
-
 int register_my_kretprobes(void) {
       int i, ret;
 
@@ -411,6 +432,85 @@ void unregister_my_kretprobes(void) {
       }
 }
 
+// Create snapshot path at /snapshot
+int init_snapshot_path(void) {
+      int error;
+      struct path root_path;
+      struct dentry *dentry;
+      const char *dirname = "snapshot";
+      int dir_len = strlen(dirname);
+
+      // Check if /snapshot already exists
+      error = kern_path("/snapshot", LOOKUP_DIRECTORY, &snapshot_root_path);
+      if (!error) {
+            // We are not implementing persistance across module reloads, so we
+            // don't expect the directory to exist
+            path_put(&snapshot_root_path);
+
+            return -EEXIST;
+      } else if (error != -ENOENT) {
+            return error;
+      }
+
+      error = kern_path("/", LOOKUP_DIRECTORY, &root_path);
+      if (error)
+            return error;
+
+      // Look up the "snapshot" dentry in the parent
+      dentry = lookup_one_len(dirname, root_path.dentry, dir_len);
+      if (IS_ERR(dentry)) {
+            path_put(&root_path);
+            return PTR_ERR(dentry);
+      }
+
+      // Even if lookup_one_len returns a dentry, check if an inode is attached
+      error = -EEXIST;
+      if (dentry->d_inode) {
+            goto cleanup;
+      }
+
+      // Create the /snapshot directory under the root inode
+      error = vfs_mkdir(root_path.mnt->mnt_idmap, root_path.dentry->d_inode,
+                        dentry, 0600);
+      if (error) {
+            goto cleanup;
+      }
+
+      // Now that the directory is created, get its path
+      error = kern_path("/snapshot", LOOKUP_DIRECTORY, &snapshot_root_path);
+
+cleanup:
+      dput(dentry);
+      path_put(&root_path);
+      return error;
+}
+
+void rm_snapshot_path(void) {
+      int err;
+      struct dentry *parent;
+
+      if (!snapshot_root_path.dentry)
+            return;
+
+      parent = dget(snapshot_root_path.dentry->d_parent);
+      if (!parent || !parent->d_inode) {
+            goto cleanup;
+      }
+
+      err = vfs_rmdir(mnt_idmap(snapshot_root_path.mnt), parent->d_inode,
+                      snapshot_root_path.dentry);
+      if (err)
+            log_err("Failed to remove /snapshot: "
+                    "%d\n",
+
+                    err);
+
+cleanup:
+      dput(parent);
+      /* Release the snapshot_root_path */
+      path_put(&snapshot_root_path);
+}
+
 int activate_snapshot(const char *dev_name, const char *passwd) {
       int error;
 
@@ -418,6 +518,7 @@ int activate_snapshot(const char *dev_name, const char *passwd) {
       if (!snapshot_auth_verify(passwd)) {
             return -AUTHF;
       }
+      AUDIT log_info("Password verified succesfully\n");
       // Tries to allocate a new snapshot device
       error = alloc_snapdevice(dev_name);
       if (error) {
@@ -438,11 +539,7 @@ int deactivate_snapshot(const char *dev_name, const char *passwd) {
       }
 
       // Tries to deallocate the snapshot device
-      error = try_init_snapdevice_by_name(dev_name, &sdev);
-      if (error) {
-            return error;
-      }
-      error = rcu_compute_on_sdev(d_num(&sdev), remove_sdev);
+      error = dealloc_snapdevice(dev_name);
       if (error) {
             return error;
       }

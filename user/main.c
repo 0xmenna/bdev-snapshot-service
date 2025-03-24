@@ -5,41 +5,26 @@
 #include <string.h>
 #include <unistd.h>
 
-#define SLEEP 156
-#define AWAKE 174
-#define NUM_THREADS 4
-#define DO_SLEEP (0);
+#define ACTIVATE 156
+#define DISACTIVATE 174
 
-int goto_sleep() { return syscall(SLEEP); }
+static const char *password = "Th3_Snapsh0t_s3cr3t";
+static const char *dev_name = "/dev/loop0";
 
-int awake() { return syscall(AWAKE); }
+static int activate_snapshot() { return syscall(ACTIVATE, dev_name, password); }
 
-void *worker(void *args) {
-   bool do_sleep;
-   int res;
-
-   do_sleep = (bool)args;
-   const char *syscall_name = do_sleep ? "SLEEP" : "AWAKE";
-
-   if (do_sleep) {
-      res = goto_sleep();
-   } else {
-      res = awake();
-   }
-   printf("%s return value:  %d\n", syscall_name, res);
-
-   return NULL;
+static int deactivate_snapshot() {
+      return syscall(DISACTIVATE, dev_name, password);
 }
 
 int main() {
+      int ret = activate_snapshot();
+      if (ret < 0) {
+            printf("Failed to activate snapshot: %d\n", ret);
+            return -1;
+      }
 
-   pthread_t tid;
-   bool do_sleep = DO_SLEEP;
-   int i;
-   for (i = 0; i < NUM_THREADS; i++) {
-      // call sleep by setting the worker input to true
-      pthread_create(&tid, NULL, worker, (void *)do_sleep);
-   }
+      printf("Snapshot activated\n");
 
-   pause();
+      return 0;
 }

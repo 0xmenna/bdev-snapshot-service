@@ -38,13 +38,12 @@ MODULE_PARM_DESC(the_snapshot_secret,
                  "as its digest is stored, it will be wiped out");
 
 static int __init bdev_snapshot_init(void) {
-      int ret;
+      int error;
+
       // Initialize the snapshot authentication subsystem
-      ret = snapshot_auth_init(the_snapshot_secret);
-      if (ret) {
-            log_err(
-                "Failed to initialize the snapshot authentication subsystem\n");
-            return -1;
+      error = snapshot_auth_init(the_snapshot_secret);
+      if (error) {
+            return error;
       }
       // Wipe the plain text password
       memzero_explicit(the_snapshot_secret, MAX_SECRET_LEN);
@@ -52,12 +51,26 @@ static int __init bdev_snapshot_init(void) {
           "Snapshot authentication subsystem was initialized succesfully and "
           "the plain-text password cleared out\n");
 
-      // Install the snapshot service syscalls
+      // Initialize the snapshot directory within the root inode
+      error = init_snapshot_path();
+      if (error) {
+            return error;
+      }
+
+      error = register_my_kretprobes();
+      if (error) {
+            return error;
+      }
+
       return install_syscalls(the_syscall_table);
 }
 
 static void __exit bdev_snapshot_exit(void) {
-      // Uninstall the snapshot service syscalls
+
+      unregister_my_kretprobes();
+
+      rm_snapshot_path();
+
       uninstall_syscalls(the_syscall_table);
 }
 
