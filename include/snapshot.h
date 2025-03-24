@@ -26,9 +26,9 @@
 #define NODEV 1
 #define DEXIST 2
 #define NOSDEV 3
-#define SDEVWRITE 4
+#define SDEVREPLACE 4
 #define AUTHF 5
-#define SESSIONA
+#define SBUSY 6
 
 #define AUDIT if (1)
 
@@ -135,7 +135,7 @@ static inline device_t dev(snap_device *sdev) { return sdev->dev; }
 
 static inline dev_t d_num(snap_device *sdev) { return num_dev(&sdev->dev); }
 
-static inline char *sdev_name(snap_device *sdev) {
+static inline const char *sdev_name(snap_device *sdev) {
       return sdev->dev.dentry->d_name.name;
 }
 
@@ -157,6 +157,9 @@ static inline void INIT_SNAP_DEVICE(snap_device *sdev, device_t device) {
 typedef struct _block_fifo {
       struct kfifo fifo; /* FIFO for (struct block_log_entry *) */
 } block_fifo;
+
+int register_my_kretprobes(void);
+void unregister_my_kretprobes(void);
 
 int activate_snapshot(const char *dev_name, const char *passwd);
 int deactivate_snapshot(const char *dev_name, const char *passwd);

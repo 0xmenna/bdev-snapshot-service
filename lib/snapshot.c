@@ -38,7 +38,7 @@
 
 #define AUDIT if (1)
 
-#define MAX_PATH 1024
+#define KPROBE_MAX_ACTIVE 20
 #define ASYNC
 
 // Global atomic counter for unique session IDs
@@ -55,10 +55,8 @@ static spinlock_t devices_lock[1 << HASH_BITS];
 // Per-CPU block log FIFO
 static DEFINE_PER_CPU(block_fifo, cpu_block_fifo);
 
-static struct kretprobe rp_mount;
-
 // Lookup of a snapshot device within the registered devices through RCU
-static snap_device *rcu_sdev_read_lock(dev_t lookup_dev) {
+static inline snap_device *rcu_sdev_read_lock(dev_t lookup_dev) {
       u32 hash = hash_dev(lookup_dev);
       snap_device *sdev;
 
@@ -103,14 +101,11 @@ static inline int rcu_compute_on_sdev(dev_t dev,
                                       int (*compute_f)(snap_device *)) {
       int ret;
       snap_device *sdev = rcu_sdev_read_lock(dev);
-      if (!sdev) {
-            AUDIT log_err("Snapshot device not registered\n");
-            rcu_sdev_read_unlock();
-            return -NOSDEV;
-      }
 
       ret = compute_f(sdev);
-      if (ret == SDEVWRITE) {
+      rcu_sdev_read_unlock();
+
+      if (ret == SDEVREPLACE) {
 #ifdef ASYNC
             call_rcu(&sdev->rcu, free_sdev_callback);
 #else
@@ -119,7 +114,6 @@ static inline int rcu_compute_on_sdev(dev_t dev,
 #endif
             ret = 0;
       }
-      rcu_sdev_read_unlock();
 
       return ret;
 }
@@ -136,21 +130,14 @@ static void rcu_register_snapdevice(snap_device *sdev) {
 }
 
 // Remove a snapshot device from the registered devices
-static void rcu_unregister_snapdevice(snap_device *sdev, int async) {
+static void rcu_unregister_snapdevice(snap_device *sdev) {
       u32 hash = hash_dev(d_num(sdev));
 
       spin_lock(&devices_lock[hash]);
       hlist_del_rcu(&sdev->hnode);
       spin_unlock(&devices_lock[hash]);
 
-#ifdef ASYNC
-      call_rcu(&sdev->rcu, free_sdev_callback);
-#else
-      synchronize_rcu();
-      kfree(sdev);
-#endif
-      AUDIT log_info("Device %s unregistered. preempt_count: %d\n",
-                     sdev_name(sdev), preempt_count());
+      AUDIT log_info("Device %s unregistered\n", sdev_name(sdev));
 }
 
 bool may_open_dev(const struct path *path) {
@@ -206,7 +193,7 @@ static int try_init_snapdevice_by_name(const char *dev_name,
 }
 
 static int init_snapshot_session(snapshot_session *snap_session,
-                                 const char *dev_name) {
+                                 const char *dev_name, time64_t timestamp) {
       struct tm tm;
       char date_str[16]; // Format: YYYYMMDD_HHMMSS
       char snap_subdirname[128];
@@ -216,7 +203,7 @@ static int init_snapshot_session(snapshot_session *snap_session,
 
       // Initialize session id and mount timestamp
       snap_session->session_id = atomic_inc_return(&global_session_id);
-      snap_session->mount_timestamp = ktime_get_real_seconds();
+      snap_session->mount_timestamp = timestamp;
 
       // Format the timestamp into a date string: YYYYMMDD_HHMMSS
       time64_to_tm(snap_session->mount_timestamp, 0, &tm);
@@ -262,6 +249,16 @@ out:
       return error;
 }
 
+// Helper function to check if a snapshot device is not registered. It
+// is used as a callback for the `rcu_compute_on_sdev` function.
+static int no_sdev(snap_device *sdev) {
+      if (sdev != NULL) {
+            return -DEXIST;
+      } else {
+            return 0;
+      }
+}
+
 // Allocate a new snapshot device if it is not already registered
 static int alloc_snapdevice(const char *dev_name) {
       snap_device tmp_sdev, *sdev;
@@ -272,14 +269,12 @@ static int alloc_snapdevice(const char *dev_name) {
             AUDIT log_err("Failed to initialize snapshot device: %d\n", error);
             return error;
       }
-      // Check if the device is already registered
-      if (rcu_sdev_read_lock(&tmp_sdev) != NULL) {
+      // Check if the snapshot device is already registered
+      error = rcu_compute_on_sdev(d_num(&tmp_sdev), no_sdev);
+      if (error) {
             AUDIT log_err("Device %s is already registered\n", dev_name);
-
-            rcu_sdev_read_unlock();
-            return -DEXIST;
+            return error;
       }
-      rcu_sdev_read_unlock();
 
       sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
       if (!sdev) {
@@ -294,10 +289,17 @@ static int alloc_snapdevice(const char *dev_name) {
       return 0;
 }
 
-static int create_new_session(snap_device *sdev) {
+// Create a new snapshot session on mount of a registered snapshot device. It is
+// used as a callback for the `rcu_compute_on_sdev` function.
+static int new_session_on_mount(snap_device *sdev) {
       snap_device *old_sdev, *new_sdev;
       snapshot_session *session;
+      time64_t mount_timestamp;
       int error;
+
+      if (!sdev) {
+            return -NOSDEV;
+      }
 
       old_sdev = sdev;
       new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
@@ -313,7 +315,8 @@ static int create_new_session(snap_device *sdev) {
             return -ENOMEM;
       }
 
-      error = init_snapshot_session(session, sdev_name(sdev));
+      mount_timestamp = ktime_get_real_seconds();
+      error = init_snapshot_session(session, sdev_name(sdev), mount_timestamp);
       if (error) {
             kfree(session);
             kfree(new_sdev);
@@ -325,7 +328,9 @@ static int create_new_session(snap_device *sdev) {
 
       rcu_replace_sdev(old_sdev, new_sdev, hash_dev(d_num(new_sdev)));
 
-      return SDEVWRITE;
+      // The free of `old_sdev` is demanded to the `rcu_compute_on_sdev`
+      // function
+      return SDEVREPLACE;
 }
 
 static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
@@ -342,7 +347,7 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
 
       dev = mnt_dentry->d_sb->s_bdev->bd_dev;
 
-      error = rcu_compute_on_sdev(dev, create_new_session);
+      error = rcu_compute_on_sdev(dev, new_session_on_mount);
       if (error) {
             AUDIT log_err("Failed to create new session for device %d : %d\n",
                           dev, error);
@@ -353,30 +358,96 @@ ret_handler:
       return 0;
 }
 
+static struct kretprobe rp_mount = {
+    .kp.symbol_name = "mount_bdev",
+    .handler = mount_bdev_ret_handler,
+    .maxactive = KPROBE_MAX_ACTIVE,
+};
+
+static struct kretprobe *retprobes[] = {&rp_mount};
+
+// Remove a snapshot device from the registered snapshot devices. It is
+// used as a callback for the `rcu_compute_on_sdev` function.
+static int remove_sdev(snap_device *sdev) {
+      if (!sdev) {
+            return -NOSDEV;
+      }
+      if (sdev->session) {
+            // Cannot remove snapshot device because it has an active session
+            return -SBUSY;
+      }
+      // Unregister the snapshot device
+      rcu_unregister_snapdevice(sdev);
+
+      // The free of `sdev` is demanded to the `rcu_compute_on_sdev` function
+      return SDEVREPLACE;
+}
+
+int register_my_kretprobes(void) {
+      int i, ret;
+
+      for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
+            ret = register_kretprobe(retprobes[i]);
+            if (ret < 0) {
+                  log_err("Failed to register kretprobe %s: %d\n",
+                          retprobes[i]->kp.symbol_name, ret);
+                  return ret;
+            } else {
+                  log_info("Registered kretprobe %s\n",
+                           retprobes[i]->kp.symbol_name);
+            }
+      }
+
+      return 0;
+}
+
+void unregister_my_kretprobes(void) {
+      int i;
+
+      for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
+            unregister_kretprobe(retprobes[i]);
+            log_info("Unregistered kretprobe %s\n",
+                     retprobes[i]->kp.symbol_name);
+      }
+}
+
 int activate_snapshot(const char *dev_name, const char *passwd) {
-      snap_device tmp_sdev, *sdev;
       int error;
 
       // Verifies password
       if (!snapshot_auth_verify(passwd)) {
-            AUDIT log_err("Authentication failure for snapshot activation\n");
             return -AUTHF;
       }
-
       // Tries to allocate a new snapshot device
       error = alloc_snapdevice(dev_name);
       if (error) {
-            AUDIT log_err("Failed to allocate snapshot device: %d\n", error);
             return error;
       }
-      return -1;
+
+      return 0;
 }
 
 int deactivate_snapshot(const char *dev_name, const char *passwd) {
 
-      AUDIT printk("%s: service not yet implemented\n", THIS_MODULE->name);
+      snap_device sdev;
+      int error;
 
-      return -1;
+      // Verifies password
+      if (!snapshot_auth_verify(passwd)) {
+            return -AUTHF;
+      }
+
+      // Tries to deallocate the snapshot device
+      error = try_init_snapdevice_by_name(dev_name, &sdev);
+      if (error) {
+            return error;
+      }
+      error = rcu_compute_on_sdev(d_num(&sdev), remove_sdev);
+      if (error) {
+            return error;
+      }
+
+      return 0;
 }
 
 #endif

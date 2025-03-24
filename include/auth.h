@@ -1,8 +1,6 @@
 #ifndef _SNAPSHOT_AUTH_H_
 #define _SNAPSHOT_AUTH_H_
 
-#define SECRET_MAX_SIZE 64
-
 /**
  * snapshot_auth_verify - Verify the provided password against the stored
  * digest.

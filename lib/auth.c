@@ -51,22 +51,12 @@ static inline bool consttime_memequal(const void *s1, const void *s2,
       return (diff == 0) ? true : false;
 }
 
-static inline bool passwd_valid_len(const char *passwd) {
-      return strlen(passwd) < SECRET_MAX_SIZE;
-}
-
 bool snapshot_auth_verify(const char *passwd) {
       u8 computed_hash[DIGEST_SIZE];
 
       // Verify priviledges
       if (!capable(CAP_SYS_ADMIN))
             return false;
-
-      if (!passwd_valid_len(passwd)) {
-            log_err("Provided password is too long, maximum: %d characters\n",
-                    SECRET_MAX_SIZE);
-            return false;
-      }
 
       int ret = derive_passwd_hash(passwd, computed_hash);
       if (ret) {
@@ -84,10 +74,10 @@ bool snapshot_auth_verify(const char *passwd) {
 }
 
 inline int snapshot_auth_init(const char *passwd) {
-      if (!passwd_valid_len(passwd)) {
+      if (strlen(passwd) > MAX_SECRET_LEN - 1) {
             log_err("Initialization password is too long, size must be a "
                     "maximum of %d\n",
-                    SECRET_MAX_SIZE);
+                    MAX_SECRET_LEN);
             return -EINVAL;
       }
       int ret = derive_passwd_hash(passwd, passwd_hash);

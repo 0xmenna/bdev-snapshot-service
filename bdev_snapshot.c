@@ -29,8 +29,8 @@ unsigned long the_syscall_table = 0x0;
 module_param(the_syscall_table, ulong, 0660);
 MODULE_PARM_DESC(the_syscall_table, "The syscall table address");
 
-static u8 the_snapshot_secret[SECRET_MAX_SIZE];
-module_param_string(the_snapshot_secret, the_snapshot_secret, SECRET_MAX_SIZE,
+static u8 the_snapshot_secret[MAX_SECRET_LEN];
+module_param_string(the_snapshot_secret, the_snapshot_secret, MAX_SECRET_LEN,
                     0);
 MODULE_PARM_DESC(the_snapshot_secret,
                  "The snapshot secret used for the authentication of the "
@@ -38,26 +38,27 @@ MODULE_PARM_DESC(the_snapshot_secret,
                  "as its digest is stored, it will be wiped out");
 
 static int __init bdev_snapshot_init(void) {
-   int ret;
-   // Initialize the snapshot authentication subsystem
-   ret = snapshot_auth_init(the_snapshot_secret);
-   if (ret) {
-      log_err("Failed to initialize the snapshot authentication subsystem\n");
-      return -1;
-   }
-   // Wipe the plain text password
-   memzero_explicit(the_snapshot_secret, SECRET_MAX_SIZE);
-   AUDIT log_info(
-       "Snapshot authentication subsystem was initialized succesfully and "
-       "the plain-text password cleared out\n");
+      int ret;
+      // Initialize the snapshot authentication subsystem
+      ret = snapshot_auth_init(the_snapshot_secret);
+      if (ret) {
+            log_err(
+                "Failed to initialize the snapshot authentication subsystem\n");
+            return -1;
+      }
+      // Wipe the plain text password
+      memzero_explicit(the_snapshot_secret, MAX_SECRET_LEN);
+      AUDIT log_info(
+          "Snapshot authentication subsystem was initialized succesfully and "
+          "the plain-text password cleared out\n");
 
-   // Install the snapshot service syscalls
-   return install_syscalls(the_syscall_table);
+      // Install the snapshot service syscalls
+      return install_syscalls(the_syscall_table);
 }
 
 static void __exit bdev_snapshot_exit(void) {
-   // Uninstall the snapshot service syscalls
-   uninstall_syscalls(the_syscall_table);
+      // Uninstall the snapshot service syscalls
+      uninstall_syscalls(the_syscall_table);
 }
 
 module_init(bdev_snapshot_init);
