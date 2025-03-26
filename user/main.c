@@ -18,13 +18,25 @@ static int deactivate_snapshot() {
 }
 
 int main() {
-      int ret = activate_snapshot();
-      if (ret < 0) {
-            printf("Failed to activate snapshot: %d\n", ret);
+      // take command line arguments from program exe
+      if (argc != 2) {
+            printf("Usage: %s <activate|deactivate>\n", argv[0]);
             return -1;
       }
 
-      printf("Snapshot activated\n");
+      if (strcmp(argv[1], "activate") == 0) {
+            if (activate_snapshot() < 0) {
+                  printf("activate_snapshot failed\n");
+                  return -1;
+            }
+            printf("Snapshot activated\n");
+      } else if (strcmp(argv[1], "deactivate") == 0) {
+            if (deactivate_snapshot() < 0) {
+                  printf("deactivate_snapshot failed\n");
+                  return -1;
+            }
+            printf("Snapshot deactivated\n");
+      }
 
       return 0;
 }

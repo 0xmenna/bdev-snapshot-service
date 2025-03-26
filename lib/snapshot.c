@@ -41,8 +41,9 @@
 #define KPROBE_MAX_ACTIVE 20
 #define ASYNC
 
-// Global atomic counter for unique session IDs
-static atomic_t global_session_id;
+// Global sessions that keep track of the session id
+// TODO: Maybe a session id is not needed, for now we keep it.
+static DECLARE_SESSIONS(sessions);
 
 // Global parent path for snapshot directories
 static struct path snapshot_root_path;
@@ -81,18 +82,40 @@ static inline void rcu_replace_sdev(snap_device *old_sdev,
       spin_unlock(&devices_lock[hash]);
 }
 
-// Callback to free a snapshot device
+// Free a snapshot device and its session without synchronization (must be used
+// in RCU context)
+static void free_sdev_no_sync(snap_device *sdev) {
+      if (sdev->session) {
+            snapshot_session *session = sdev->session;
+            int i;
+
+            // Release the reference held by snap_path
+            path_put(&session->snap_path);
+
+            // Free all allocated committed blocks
+            for (i = 0; i < (1 << COMMITTED_HASH_BITS); i++) {
+                  struct committed_block *cb;
+                  struct hlist_node *tmp;
+                  hlist_for_each_entry_safe(
+                      cb, tmp, &session->committed_blocks[i], hnode) {
+                        hlist_del(&cb->hnode);
+                        kfree(cb);
+                  }
+            }
+            kfree(session);
+      }
+
+      kfree(sdev);
+}
+
+// Callback to free a snapshot device and its session within async RCU context
 static void free_sdev_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
-      /**
-       * Why print preemt_count??
-       *
-       * To check whether this callback is atomic context or not.
-       * preempt_count here is more than 0. Because it is irq context.
-       */
-      log_info("Callback free: device : %s, preempt_count : %d\n",
-               sdev_name(sdev), preempt_count());
-      kfree(sdev);
+
+      AUDIT log_info("Callback free: device : %s, preempt_count : %d\n",
+                     sdev_name(sdev), preempt_count());
+
+      free_sdev_no_sync(sdev);
 }
 
 // Computes a function on a snapshot device. It looks up the device by its
@@ -110,7 +133,7 @@ static inline int rcu_compute_on_sdev(dev_t dev,
             call_rcu(&sdev->rcu, free_sdev_callback);
 #else
             synchronize_rcu();
-            kfree(sdev);
+            free_sdev_no_sync(sdev);
 #endif
             ret = 0;
       }
@@ -137,7 +160,7 @@ static void rcu_unregister_snapdevice(snap_device *sdev) {
       hlist_del_rcu(&sdev->hnode);
       spin_unlock(&devices_lock[hash]);
 
-      AUDIT log_info("Device %s unregistered\n", sdev_name(sdev));
+      log_info("Device %s unregistered\n", sdev_name(sdev));
 }
 
 bool may_open_dev(const struct path *path) {
@@ -204,7 +227,16 @@ static int init_snapshot_session(snapshot_session *snap_session,
       int error;
 
       // Initialize session id and mount timestamp
-      snap_session->session_id = atomic_inc_return(&global_session_id);
+      snap_session->session_id = atomic_inc_return(&sessions.session_id);
+      if (unlikely(snap_session->session_id <= 0)) {
+            log_err("Reached max number of sessions\n");
+
+            // We don't care about synchronization here. At most, more threds
+            // will detect the overflow and all set the status to OVERFLOW.
+            sessions.status = OVERFLOW;
+
+            return -SESSIONOVFLW;
+      }
       snap_session->mount_timestamp = timestamp;
 
       // Format the timestamp into a date string: YYYYMMDD_HHMMSS
@@ -218,7 +250,7 @@ static int init_snapshot_session(snapshot_session *snap_session,
                date_str);
 
       // Construct the full snapshot directory path
-      snprintf(snap_dirname, sizeof(snap_dirname), "%s/%s",
+      snprintf(snap_dirname, sizeof(snap_dirname), "/%s/%s",
                snapshot_root_path.dentry->d_name.name, snap_subdirname);
 
       // Allocate a new dentry for the subdirectory
@@ -231,7 +263,7 @@ static int init_snapshot_session(snapshot_session *snap_session,
 
       // Create the new directory
       error = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
-                        d_inode(snapshot_root_path.dentry), subdentry, 0600);
+                        d_inode(snapshot_root_path.dentry), subdentry, 0500);
       if (error) {
             AUDIT log_err("vfs_mkdir failed for %s: %d\n", snap_subdirname,
                           error);
@@ -298,10 +330,13 @@ static int alloc_snapdevice(const char *dev_name) {
 // used as a callback for the `rcu_compute_on_sdev` function.
 static int remove_sdev(snap_device *sdev) {
       if (!sdev) {
+            log_err("No snapshot device found for %s\n", sdev_name(sdev));
             return -NOSDEV;
       }
       if (sdev->session) {
             // Cannot remove snapshot device because it has an active session
+            log_err("Cannot remove snapshot device %s: active session\n",
+                    sdev_name(sdev));
             return -SBUSY;
       }
       // Unregister the snapshot device
@@ -325,6 +360,55 @@ static int dealloc_snapdevice(const char *dev_name) {
       }
 
       return 0;
+}
+
+int init_snapshot_path(void) {
+      int error;
+      struct path root_path;
+      struct dentry *dentry = NULL;
+
+      // Check if /snapshot already exists
+      error = kern_path("/snapshot", LOOKUP_DIRECTORY, &snapshot_root_path);
+      if (!error) {
+            log_info(
+                "Snapshot directory already exists, no need to create it\n");
+            return 0;
+      } else if (error != -ENOENT) {
+            return error;
+      }
+
+      error = kern_path("/", LOOKUP_DIRECTORY, &root_path);
+      if (error)
+            return error;
+
+      dentry = d_alloc_name(root_path.dentry, "snapshot");
+      if (!dentry) {
+            error = -ENOMEM;
+            goto cleanup_root;
+      }
+
+      error = vfs_mkdir(root_path.mnt->mnt_idmap, root_path.dentry->d_inode,
+                        dentry, 0500);
+      if (error)
+            goto cleanup_all;
+
+      /* Now that the directory is created, get its path */
+      error = kern_path("/snapshot", LOOKUP_DIRECTORY, &snapshot_root_path);
+      if (!error) {
+            log_info("Root Snapshot directory created\n");
+      }
+
+cleanup_all:
+      dput(dentry);
+cleanup_root:
+      path_put(&root_path);
+      return error;
+}
+
+void put_snapshot_path(void) {
+      path_put(&snapshot_root_path);
+
+      log_info("Snapshot path released\n");
 }
 
 // Create a new snapshot session on mount of a registered snapshot device. It is
@@ -354,8 +438,11 @@ static int new_session_on_mount(snap_device *sdev) {
       }
 
       mount_timestamp = ktime_get_real_seconds();
-      error = init_snapshot_session(session, sdev_name(sdev), mount_timestamp);
+      error =
+          init_snapshot_session(session, sdev_name(new_sdev), mount_timestamp);
       if (error) {
+            AUDIT log_err("Failed to create new session for device %s : %d\n",
+                          sdev_name(new_sdev), error);
             kfree(session);
             kfree(new_sdev);
             return error;
@@ -378,19 +465,15 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
       snap_device *sdev;
       int error;
 
-      // TODO: other kernel versions return a block_device
+      // TODO: other kernel versions might return a block_device
       mnt_dentry = (struct dentry *)regs_return_value(regs);
       if (IS_ERR(mnt_dentry))
             goto ret_handler;
 
       dev = mnt_dentry->d_sb->s_bdev->bd_dev;
 
-      error = rcu_compute_on_sdev(dev, new_session_on_mount);
-      if (error) {
-            AUDIT log_err("Failed to create new session for device %d : %d\n",
-                          dev, error);
-            goto ret_handler;
-      }
+      // Don't really care about the error
+      rcu_compute_on_sdev(dev, new_session_on_mount);
 
 ret_handler:
       return 0;
@@ -402,7 +485,72 @@ static struct kretprobe rp_mount = {
     .maxactive = KPROBE_MAX_ACTIVE,
 };
 
-static struct kretprobe *retprobes[] = {&rp_mount};
+// Callback function to clear the snapshot session on unmount.
+static int free_session_on_umount(snap_device *sdev) {
+      snap_device *old_sdev, *new_sdev;
+
+      if (!sdev)
+            return -NOSDEV;
+
+      old_sdev = sdev;
+      new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+      if (!new_sdev)
+            return -ENOMEM;
+
+      memcpy(new_sdev, old_sdev, sizeof(snap_device));
+
+      // Set the session pointer to NULL to mark the unmount
+      new_sdev->session = NULL;
+      AUDIT log_info("Snapshot session cleared for device: %s\n",
+                     sdev_name(sdev));
+
+      // Replace the old snapshot device entry with the updated one
+      rcu_replace_sdev(old_sdev, new_sdev, hash_dev(d_num(new_sdev)));
+
+      return SDEVREPLACE;
+}
+
+struct umount_data {
+      dev_t dev;
+};
+
+static int umount_entry_handler(struct kretprobe_instance *ri,
+                                struct pt_regs *regs) {
+      struct umount_data *ud = (struct umount_data *)ri->data;
+#ifdef CONFIG_X86_64
+      struct super_block *sb = (struct super_block *)regs->di;
+#else
+#error "Unsupported architecture"
+#endif
+
+      if (!sb || !sb->s_bdev) {
+            return -1;
+      }
+
+      ud->dev = sb->s_bdev->bd_dev;
+      return 0;
+}
+
+static int umount_ret_handler(struct kretprobe_instance *ri,
+                              struct pt_regs *regs) {
+      struct umount_data *ud = (struct umount_data *)ri->data;
+      dev_t dev = ud->dev;
+
+      // Don't care about the error
+      rcu_compute_on_sdev(dev, free_session_on_umount);
+
+      return 0;
+}
+
+static struct kretprobe rp_umount = {
+    .kp.symbol_name = "kill_block_super",
+    .entry_handler = umount_entry_handler,
+    .handler = umount_ret_handler,
+    .data_size = sizeof(struct umount_data),
+    .maxactive = KPROBE_MAX_ACTIVE,
+};
+
+static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount};
 
 int register_my_kretprobes(void) {
       int i, ret;
@@ -432,85 +580,6 @@ void unregister_my_kretprobes(void) {
       }
 }
 
-// Create snapshot path at /snapshot
-int init_snapshot_path(void) {
-      int error;
-      struct path root_path;
-      struct dentry *dentry;
-      const char *dirname = "snapshot";
-      int dir_len = strlen(dirname);
-
-      // Check if /snapshot already exists
-      error = kern_path("/snapshot", LOOKUP_DIRECTORY, &snapshot_root_path);
-      if (!error) {
-            // We are not implementing persistance across module reloads, so we
-            // don't expect the directory to exist
-            path_put(&snapshot_root_path);
-
-            return -EEXIST;
-      } else if (error != -ENOENT) {
-            return error;
-      }
-
-      error = kern_path("/", LOOKUP_DIRECTORY, &root_path);
-      if (error)
-            return error;
-
-      // Look up the "snapshot" dentry in the parent
-      dentry = lookup_one_len(dirname, root_path.dentry, dir_len);
-      if (IS_ERR(dentry)) {
-            path_put(&root_path);
-            return PTR_ERR(dentry);
-      }
-
-      // Even if lookup_one_len returns a dentry, check if an inode is attached
-      error = -EEXIST;
-      if (dentry->d_inode) {
-            goto cleanup;
-      }
-
-      // Create the /snapshot directory under the root inode
-      error = vfs_mkdir(root_path.mnt->mnt_idmap, root_path.dentry->d_inode,
-                        dentry, 0600);
-      if (error) {
-            goto cleanup;
-      }
-
-      // Now that the directory is created, get its path
-      error = kern_path("/snapshot", LOOKUP_DIRECTORY, &snapshot_root_path);
-
-cleanup:
-      dput(dentry);
-      path_put(&root_path);
-      return error;
-}
-
-void rm_snapshot_path(void) {
-      int err;
-      struct dentry *parent;
-
-      if (!snapshot_root_path.dentry)
-            return;
-
-      parent = dget(snapshot_root_path.dentry->d_parent);
-      if (!parent || !parent->d_inode) {
-            goto cleanup;
-      }
-
-      err = vfs_rmdir(mnt_idmap(snapshot_root_path.mnt), parent->d_inode,
-                      snapshot_root_path.dentry);
-      if (err)
-            log_err("Failed to remove /snapshot: "
-                    "%d\n",
-
-                    err);
-
-cleanup:
-      dput(parent);
-      /* Release the snapshot_root_path */
-      path_put(&snapshot_root_path);
-}
-
 int activate_snapshot(const char *dev_name, const char *passwd) {
       int error;
 
@@ -523,6 +592,11 @@ int activate_snapshot(const char *dev_name, const char *passwd) {
       error = alloc_snapdevice(dev_name);
       if (error) {
             return error;
+      }
+      // Increment module reference count
+      bool success = try_module_get(THIS_MODULE);
+      if (!success) {
+            return -MODUNLOAD;
       }
 
       return 0;
@@ -543,6 +617,8 @@ int deactivate_snapshot(const char *dev_name, const char *passwd) {
       if (error) {
             return error;
       }
+      // Decrement module reference count
+      module_put(THIS_MODULE);
 
       return 0;
 }

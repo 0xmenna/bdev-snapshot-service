@@ -82,9 +82,8 @@ mount_bdev_snapshot:
 	$(call ins_module,bdev_snapshot)
 
 mount_testing_fs:
-	mkdir /tmp/mount
 	$(call ins_module,singlefile_fs)
-	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image /tmp/mount/
+	
 
 unmount_usctm:
 	$(call rmm_module,usctm/the_usctm.ko)

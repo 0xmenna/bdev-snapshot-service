@@ -4,6 +4,11 @@ sudo losetup --find --show disk.img
 losetup -a
 sudo mount /dev/loop0 /tmp/mount
 
-
 sudo umount /tmp/mnt
 sudo losetup -d /dev/loop0
+
+
+############################################
+
+mkdir /tmp/mount
+sudo mount -o loop -t singlefilefs tests/singlefile_fs/image /tmp/mount/

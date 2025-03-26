@@ -1,4 +1,3 @@
-
 #ifndef _SNAPSHOT_H_
 
 #define _SNAPSHOT_H_
@@ -29,8 +28,21 @@
 #define SDEVREPLACE 4
 #define AUTHF 5
 #define SBUSY 6
+#define MODUNLOAD 7
+#define SESSIONOVFLW 8
 
 #define AUDIT if (1)
+
+typedef struct sessions {
+      atomic_t session_id;
+      enum { OVERFLOW, OK } status;
+} sessions_t;
+
+#define DECLARE_SESSIONS(name)                                                 \
+      sessions_t name = {                                                      \
+          .session_id = ATOMIC_INIT(0),                                        \
+          .status = OK,                                                        \
+      }
 
 typedef struct _device {
       // In more recent kernels to work with block devices, we use vfs related
@@ -92,6 +104,7 @@ typedef struct _snapshot_session {
       u64 mount_timestamp;
       struct path snap_path;
       struct hlist_head committed_blocks[1 << COMMITTED_HASH_BITS];
+      spinlock_t locks[1 << COMMITTED_HASH_BITS];
 } snapshot_session;
 
 struct committed_block {
@@ -162,7 +175,7 @@ int register_my_kretprobes(void);
 void unregister_my_kretprobes(void);
 
 int init_snapshot_path(void);
-void rm_snapshot_path(void);
+void put_snapshot_path(void);
 
 int activate_snapshot(const char *dev_name, const char *passwd);
 int deactivate_snapshot(const char *dev_name, const char *passwd);

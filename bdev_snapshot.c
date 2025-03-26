@@ -51,7 +51,7 @@ static int __init bdev_snapshot_init(void) {
           "Snapshot authentication subsystem was initialized succesfully and "
           "the plain-text password cleared out\n");
 
-      // Initialize the snapshot directory within the root inode
+      // Initialize the snapshot directory
       error = init_snapshot_path();
       if (error) {
             return error;
@@ -69,7 +69,7 @@ static void __exit bdev_snapshot_exit(void) {
 
       unregister_my_kretprobes();
 
-      rm_snapshot_path();
+      put_snapshot_path();
 
       uninstall_syscalls(the_syscall_table);
 }
