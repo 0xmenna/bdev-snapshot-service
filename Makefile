@@ -36,13 +36,23 @@ endef
 
 # -----------------------------------------------------------
 
-up: all mount
+up: all load
 
-down: unmount clean
+down: unload clean
 
-all: build_usctm build_bdev_snapshot build_testing_fs create_testing_fs
+all: build_usctm build_bdev_snapshot build_testing_fs
 
-# Clone the usctm repository if it doesn't exist.
+clean:
+	$(call clean_module,.)
+	$(call clean_module,usctm)
+	$(call clean_module,tests/singlefile_fs)
+	rm -rf usctm
+	rm tests/singlefile_fs/singlefilemakefs
+
+load: load_usctm load_bdev_snapshot load_testing_fs_driver
+
+unload: unload_testing_fs_driver unload_bdev_snapshot unload_usctm
+
 clone_usctm:
 	@if [ ! -d "usctm" ]; then \
 		git clone $(USCTM_REPO); \
@@ -59,40 +69,39 @@ build_bdev_snapshot:
 build_testing_fs:
 	gcc tests/singlefile_fs/singlefilemakefs.c -o tests/singlefile_fs/singlefilemakefs
 	$(call build_module,tests/singlefile_fs)
-	
+
+load_usctm:
+	$(call ins_module,usctm)
+
+load_bdev_snapshot:
+	$(call ins_module,bdev_snapshot)
+
+unload_usctm:
+	$(call rmm_module,usctm/the_usctm.ko)
+
+unload_bdev_snapshot:
+	$(call rmm_module,the_bdev_snapshot.ko)
+
 create_testing_fs:
 	dd bs=4096 count=100 if=/dev/zero of=tests/singlefile_fs/image
 	./tests/singlefile_fs/singlefilemakefs tests/singlefile_fs/image
+	sudo losetup /dev/loop0 tests/singlefile_fs/image
+	mkdir /tmp/mnt
 
-clean:
-	$(call clean_module,.)
-	$(call clean_module,usctm)
-	$(call clean_module,tests/singlefile_fs)
-	rm -rf usctm
-	rm tests/singlefile_fs/singlefilemakefs
+rm_testing_fs:
+	rm -rf /tmp/mnt
+	sudo losetup -d /dev/loop0
+	rm tests/singlefile_fs/image
 
-mount: mount_usctm mount_bdev_snapshot mount_testing_fs
+load_testing_fs_driver:
+	$(call ins_module,singlefile_fs)
 
-unmount: unmount_bdev_snapshot unmount_testing_fs unmount_usctm
-
-mount_usctm:
-	$(call ins_module,usctm)
-
-mount_bdev_snapshot:
-	$(call ins_module,bdev_snapshot)
+unload_testing_fs_driver:
+	$(call rmm_module,tests/singlefile_fs/singlefilefs.ko)
 
 mount_testing_fs:
-	$(call ins_module,singlefile_fs)
-	
+	sudo mount -t singlefilefs /dev/loop0 /tmp/mnt
 
-unmount_usctm:
-	$(call rmm_module,usctm/the_usctm.ko)
-
-unmount_bdev_snapshot:
-	$(call rmm_module,the_bdev_snapshot.ko)
-
-unmount_testing_fs:
-	sudo umount /tmp/mount/
-	rm -rf /tmp/mount
-	$(call rmm_module,tests/singlefile_fs/singlefilefs.ko)
+umount_testing_fs:
+	sudo umount /tmp/mnt
 

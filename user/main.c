@@ -17,7 +17,7 @@ static int deactivate_snapshot() {
       return syscall(DISACTIVATE, dev_name, password);
 }
 
-int main() {
+int main(int argc, char **argv) {
       // take command line arguments from program exe
       if (argc != 2) {
             printf("Usage: %s <activate|deactivate>\n", argv[0]);
