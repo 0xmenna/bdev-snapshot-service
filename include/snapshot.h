@@ -30,6 +30,10 @@
 #define SBUSY 6
 #define MODUNLOAD 7
 #define SESSIONOVFLW 8
+#define SDEVNOTACTIVE 9
+#define NOPHYSBLOCK 10
+#define NOBHEAD 11
+#define NOMNTD 12
 
 #define AUDIT if (1)
 
@@ -65,47 +69,72 @@ static inline dev_t num_dev(device_t *device) {
 
 static inline void dev_put(device_t *device) { dput(device->dentry); }
 
+static inline void dev_get(device_t *device) { dget(device->dentry); }
+
 static inline void INIT_DEV(device_t *device, struct dentry *dentry) {
-      device->dentry = dentry;
+      device->dentry = dget(dentry);
 }
 
-// Check if a block device is mounted
-static bool is_block_device_mounted(struct inode *inode) {
-      struct block_device *bdev;
-      struct super_block *sb;
+typedef struct _mnt_ref {
+      struct dentry *dentry;
+} mnt_ref;
 
-      /* Ensure the inode represents a block device */
-      if (!S_ISBLK(inode->i_mode))
-            return false;
+static inline mnt_ref INIT_MNT_REF(struct dentry *dentry) {
+      mnt_ref ref;
 
-      /* Get the block_device structure */
-      bdev = I_BDEV(inode);
-
-      /* Check if bd_holder is non-NULL */
-      sb = bdev->bd_holder;
-      if (sb)
-            return true; // Filesystem is mounted
-      else
-            return false; // No filesystem is mounted
+      ref.dentry = dentry;
+      return ref;
 }
+
+static inline void mnt_ref_put(mnt_ref *ref) { dput(ref->dentry); }
+
+static inline mnt_ref mnt_ref_get(mnt_ref *ref) {
+      mnt_ref new_ref;
+
+      new_ref.dentry = dget(ref->dentry);
+      return new_ref;
+}
+
+static inline bool has_dentry(mnt_ref *ref) { return ref->dentry != NULL; }
 
 /**
  * struct snapshot_session - Represents an active snapshot session.
+ * @mnt_ref:       Reference to the mount point of the file system being
+ * snapshotted.
  * @session_id:  Unique session identifier.
  * @mount_timestamp:  Unix timestamp (u64) when the session was activated.
- * @snap_dir:    Snapshot directory path (e.g.,
+ * @snap_path:    Snapshot directory path (e.g.,
  * "/snapshot/devname_timestamp").
  * @committed_blocks:  Hash table for committed blocks (i.e. blocks that
  * eventually go to storage).
+ * @locks:      Spinlocks for each hash table entry.
  *
  */
 typedef struct _snapshot_session {
+      mnt_ref mnt;
       int session_id;
       u64 mount_timestamp;
       struct path snap_path;
       struct hlist_head committed_blocks[1 << COMMITTED_HASH_BITS];
       spinlock_t locks[1 << COMMITTED_HASH_BITS];
 } snapshot_session;
+
+static inline struct path session_path_get(snapshot_session *session) {
+      path_get(&session->snap_path);
+      return session->snap_path;
+}
+
+static inline void session_path_put(snapshot_session *session) {
+      path_put(&session->snap_path);
+}
+
+static inline mnt_ref session_mnt_get(snapshot_session *session) {
+      return mnt_ref_get(&session->mnt);
+}
+
+static inline void session_mnt_put(snapshot_session *session) {
+      mnt_ref_put(&session->mnt);
+}
 
 struct committed_block {
       sector_t block;
@@ -114,17 +143,21 @@ struct committed_block {
 
 /**
  * struct block_log_entry - Represents a logged block modification.
- * @session_id:   Snapshot session id to which this entry belongs.
- * @block_offset: Block (or sector) offset on the device.
+ * @snap_path:   Identifies the snapshot path within an active session.
+ * @mnt_ref:    Reference to the mount point of the file system associated to
+ * the data being handled. It is needed to avoid the umounting while entries
+ * must still be processed.
+ * @block: Block (or sector) offset on the device.
  * @orig_data:    Pointer to a copy of the original block data.
  * @data_size:    Size in bytes of the block.
  *
  * Each entry records the original content of a modified block.
  */
 typedef struct block_log_entry {
-      int session_id;
+      struct path snap_path;
+      mnt_ref mnt_ref;
       sector_t block;
-      void *orig_data;
+      char *orig_data;
       size_t data_size;
 } blog_entry;
 
@@ -146,7 +179,7 @@ typedef struct _snap_device {
 
 static inline device_t dev(snap_device *sdev) { return sdev->dev; }
 
-static inline dev_t d_num(snap_device *sdev) { return num_dev(&sdev->dev); }
+extern inline dev_t d_num(snap_device *sdev) { return num_dev(&sdev->dev); }
 
 static inline const char *sdev_name(snap_device *sdev) {
       return sdev->dev.dentry->d_name.name;
@@ -162,13 +195,13 @@ static inline void INIT_SNAP_DEVICE(snap_device *sdev, device_t device) {
 
 /**
  * block_fifo - Used for per-CPU FIFO for block log entries.
- * @fifo: A kfifo holding pointers to block_log_entry structures.
+ * @fifo: A kfifo holding pointers to blog_entry structures.
  *
  * Each FIFO can hold entries of different sessions, allowing
  * concurrent managment of the same session.
  */
 typedef struct _block_fifo {
-      struct kfifo fifo; /* FIFO for (struct block_log_entry *) */
+      struct kfifo fifo; /* FIFO for (struct blog_entry *) */
 } block_fifo;
 
 int register_my_kretprobes(void);
