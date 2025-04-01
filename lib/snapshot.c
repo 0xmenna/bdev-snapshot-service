@@ -49,109 +49,21 @@
       } while (0)
 #endif
 
-#define KPROBE_MAX_ACTIVE 20
-
-// Global sessions that keep track of the session id
-// TODO: Maybe a session id is not needed, for now we keep it.
-static DECLARE_SESSIONS(sessions);
-
 // Global parent path for snapshot directories
 static struct path snapshot_root_path;
 
 // Registered devices to the snapshot subsystem
-static struct hlist_head devices[1 << HASH_BITS];
-// Locks for the registered devices
-static spinlock_t devices_lock[1 << HASH_BITS];
+static struct snapshot_devices devices;
 
 // Per-CPU block log FIFO
 static DEFINE_PER_CPU(block_fifo, cpu_block_fifo);
 
-// Free a snapshot device and its session without synchronization (must be used
-// in RCU context)
-static void free_sdev_no_sync(snap_device *sdev) {
-      if (sdev->session) {
-            snapshot_session *session = sdev->session;
-            int i;
-
-            // Release the reference held by snap_path
-            path_put(&session->snap_path);
-
-            // Free all allocated committed blocks
-            for (i = 0; i < (1 << COMMITTED_HASH_BITS); i++) {
-                  struct committed_block *cb;
-                  struct hlist_node *tmp;
-                  hlist_for_each_entry_safe(
-                      cb, tmp, &session->committed_blocks[i], hnode) {
-                        hlist_del(&cb->hnode);
-                        kfree(cb);
-                  }
-            }
-            kfree(session);
-      }
-
-      dev_put(&sdev->dev);
-
-      kfree(sdev);
-}
-
-// Callback to free a snapshot device and its session within async RCU context
-static inline void free_sdev_callback(struct rcu_head *rcu) {
-      snap_device *sdev = container_of(rcu, snap_device, rcu);
-
-      AUDIT log_info("Callback free: device : %s, preempt_count : %d\n",
-                     sdev_name(sdev), preempt_count());
-
-      free_sdev_no_sync(sdev);
-}
-
-// Add a snapshot device to the registered devices
-static inline void rcu_register_snapdevice(snap_device *sdev) {
-      u32 hash = hash_dev(d_num(sdev));
-
-      HLIST_RCU_INSERT(sdev, devices, devices_lock, hash);
-
-      log_info("New Device %s registered\n", sdev_name(sdev));
-}
-
-// Remove a snapshot device from the registered devices
-static inline void rcu_unregister_snapdevice(snap_device *sdev) {
-      u32 hash = hash_dev(d_num(sdev));
-
-      HLIST_RCU_REMOVE(sdev, devices_lock, hash);
-
-      log_info("Device %s unregistered\n", sdev_name(sdev));
-}
-
-// Computes a function on a snapshot device. It looks up the device by its
-// `dev_t` identifier and calls the function following RCU based "locking".
-inline int rcu_compute_on_sdev(dev_t dev, void *arg,
-                               int (*compute_f)(snap_device *, void *)) {
-      int ret;
-      snap_device *sdev =
-          HLIST_RCU_LOOKUP(dev, hash_dev, devices, snap_device, d_num);
-
-      ret = compute_f(sdev, arg);
-      HLIST_RCU_READ_UNLOCK();
-
-      if (ret == SDEVREPLACE) {
-#ifdef ASYNC
-            call_rcu(&sdev->rcu, free_sdev_callback);
-#else
-            synchronize_rcu();
-            free_sdev_no_sync(sdev);
-#endif
-            ret = 0;
-      }
-
-      return ret;
-}
-
-bool may_open_dev(const struct path *path) {
+static inline bool may_open_dev(const struct path *path) {
       return !(path->mnt->mnt_flags & MNT_NODEV) &&
              !(path->mnt->mnt_sb->s_iflags & SB_I_NODEV);
 }
 
-static int get_bdev_by_name(const char *pathname, device_t *dev) {
+static int get_dev_by_name(const char *pathname, generic_dev_t *dev) {
       struct inode *inode;
       struct path path;
       int error;
@@ -165,66 +77,56 @@ static int get_bdev_by_name(const char *pathname, device_t *dev) {
       }
       inode = d_backing_inode(path.dentry);
       error = -ENOTBLK;
-      if (!S_ISBLK(inode->i_mode))
-            goto out_path_put;
+      if (!S_ISBLK(inode->i_mode)) {
+            // The provided pathname represents the actual pathname associated
+            // to the file managed as device-file (used for a loop device).
+            file_dev_t fdev;
+            INIT_FDEV(&fdev, path.dentry);
+            dev->type = FDEV;
+            dev->fdev = fdev;
 
+            error = 0;
+            goto out_path_put;
+      }
       error = -EACCES;
       if (!may_open_dev(&path))
             goto out_path_put;
 
-      INIT_DEV(dev, path.dentry);
+      // An actual block device
+      device_t bdev;
+      INIT_DEV(&dev, path.dentry);
+      dev->type = BDEV;
+      dev->dev = bdev;
+
       error = 0;
 out_path_put:
       path_put(&path);
       return error;
 }
 
-static int try_init_snapdevice_by_name(const char *dev_name,
-                                       snap_device *sdev) {
-      device_t dev;
-      int err;
-
-      err = get_bdev_by_name(dev_name, &dev);
-      if (err) {
-            AUDIT log_err("Failed to get device %s by name: %d\n", dev_name,
-                          err);
-            return err;
-      }
-
-      INIT_SNAP_DEVICE(sdev, dev);
-      AUDIT log_info("Snapshot device %s initialized succesfully\n",
-                     sdev_name(sdev));
-
-      return 0;
-}
-
-static int init_snapshot_session(snapshot_session *snap_session,
-                                 const char *dev_name, time64_t timestamp,
-                                 mnt_ref mnt) {
+// Function to create a new snapshot session directory. It is used as a
+// callback for the `rcu_compute_on_sdev` function.
+static int session_path_callback(snap_device *sdev, void *arg) {
       struct tm tm;
       char date_str[16]; // Format: YYYYMMDD_HHMMSS
       char snap_subdirname[128];
       char snap_dirname[128];
       struct dentry *subdentry = NULL;
-      int error;
+      int ret;
 
-      snap_session->mnt = mnt;
-
-      // Initialize session id and mount timestamp
-      snap_session->session_id = atomic_inc_return(&sessions.session_id);
-      if (unlikely(snap_session->session_id <= 0)) {
-            log_err("Reached max number of sessions\n");
-
-            // We don't care about synchronization here. At most, more threds
-            // will detect the overflow and all set the status to OVERFLOW.
-            sessions.status = OVERFLOW;
-
-            return -SESSIONOVFLW;
+      if (!sdev) {
+            return -NOSDEV;
       }
-      snap_session->mount_timestamp = timestamp;
+      if (!sdev->session) {
+            return -SDEVNOTACTIVE;
+      }
+
+      if (d_session(sdev->session)) {
+            return -PATHEXIST;
+      }
 
       // Format the timestamp into a date string: YYYYMMDD_HHMMSS
-      time64_to_tm(snap_session->mount_timestamp, 0, &tm);
+      time64_to_tm(sdev->session->mount_timestamp, 0, &tm);
       snprintf(date_str, sizeof(date_str), "%04ld%02ld%02ld_%02ld%02ld%02ld",
                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
                tm.tm_min, tm.tm_sec);
@@ -246,31 +148,53 @@ static int init_snapshot_session(snapshot_session *snap_session,
       }
 
       // Create the new directory
-      error = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
-                        d_inode(snapshot_root_path.dentry), subdentry, 0500);
-      if (error) {
+      ret = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
+                      d_inode(snapshot_root_path.dentry), subdentry, 0500);
+      if (ret) {
+            if (ret == -EEXIST) {
+                  // Other threads may have created the directory
+                  ret = -SNAPDIR_EXIST;
+            }
             AUDIT log_err("vfs_mkdir failed for %s: %d\n", snap_subdirname,
-                          error);
+                          ret);
             goto out;
       }
+      // At this point, a single thread will execute this code for a given snap
+      // device session, because the rest have failed to create the directory.
+      snap_device *old_sdev = sdev;
+      snap_device *new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+      if (!new_sdev) {
+            ret = -ENOMEM;
+            goto out;
+      }
+      memcpy(new_sdev, old_sdev, sizeof(snap_device));
 
       // Lookup the full path of the new directory
-      error = kern_path(snap_dirname, LOOKUP_FOLLOW, &snap_session->snap_path);
-      if (error) {
+      ret =
+          kern_path(snap_dirname, LOOKUP_FOLLOW, &new_sdev->session->snap_path);
+      if (ret) {
             AUDIT log_err("Failed to lookup new directory %s: %d\n",
-                          snap_dirname, error);
+                          snap_dirname, ret);
+            kfree(new_sdev);
             goto out;
       }
 
-      error = 0;
+      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices_lock,
+                        hash_dev(d_num(new_sdev)));
+
+      dev_get(&new_sdev->dev);
+
+      // This is to avoid freeing the session in the callback (since it is used
+      // by the newer snap device)
+      ret = FREE_SDEV_NO_SESSION;
 out:
       dput(subdentry);
-      return error;
-}
+      return ret;
+};
 
 // Helper function to check if a snapshot device is not registered. It
 // is used as a callback for the `rcu_compute_on_sdev` function.
-static int no_sdev(snap_device *sdev, void *arg) {
+static inline int no_sdev_callback(snap_device *sdev, void *arg) {
       if (sdev != NULL) {
             return -DEXIST;
       } else {
@@ -278,74 +202,91 @@ static int no_sdev(snap_device *sdev, void *arg) {
       }
 }
 
-// Allocate a new snapshot device if it is not already registered
-static int alloc_snapdevice(const char *dev_name) {
-      snap_device tmp_sdev, *sdev;
+static int register_device(const char *dev_name) {
+      generic_dev_t dev;
       int error;
-      // Try to initialize the snapshot device
-      error = try_init_snapdevice_by_name(dev_name, &tmp_sdev);
+      // Try to initialize the device
+      error = get_dev_by_name(dev_name, &dev);
       if (error) {
-            AUDIT log_err("Failed to initialize snapshot device %s: %d\n",
-                          dev_name, error);
-            return error;
-      }
-      // Check if the snapshot device is already registered
-      error = rcu_compute_on_sdev(d_num(&tmp_sdev), NULL, no_sdev);
-      if (error) {
-            dev_put(&tmp_sdev.dev);
-            AUDIT log_err("Device %s is already registered\n",
-                          sdev_name(&tmp_sdev));
-
+            AUDIT log_err("Failed to initialize device %s: %d\n", dev_name,
+                          error);
             return error;
       }
 
-      sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
-      if (!sdev) {
-            dev_put(&tmp_sdev.dev);
-            AUDIT log_err("Failed to allocate memory for snapshot device %s\n",
-                          dev_name);
-            return -ENOMEM;
-      }
-      memcpy(sdev, &tmp_sdev, sizeof(snap_device));
+      switch (dev.type) {
+      case BDEV:
+            snap_device tmp_sdev, *sdev;
+            INIT_SNAP_DEVICE(&tmp_sdev, dev.dev);
+            // Check if the snapshot device is already registered
+            error = rcu_compute_on_sdev(&devices, d_num(&tmp_sdev), NULL,
+                                        no_sdev_callback);
+            if (error) {
+                  put_dev(&tmp_sdev.dev);
+                  AUDIT log_err("Device %s is already registered\n",
+                                sdev_name(&tmp_sdev));
 
-      // Register the snapshot device
-      rcu_register_snapdevice(sdev);
+                  return error;
+            }
+            sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+            if (!sdev) {
+                  put_dev(&tmp_sdev.dev);
+                  return -ENOMEM;
+            }
+            memcpy(sdev, &tmp_sdev, sizeof(snap_device));
+
+            // Register the snapshot device
+            rcu_register_snapdevice(&devices, sdev);
+            break;
+      case FDEV:
+            // Check if the device file is already registered
+            error = rcu_compute_on_filedev(&devices, &dev.fdev, NULL,
+                                           no_file_dev_callback);
+            if (error) {
+                  put_fdev(&dev.fdev);
+                  AUDIT log_err("Device file %s is already registered\n",
+                                dev_name);
+                  return error;
+            }
+
+            file_dev_t *fdev = kmalloc(sizeof(file_dev_t), GFP_KERNEL);
+            if (!fdev) {
+                  put_fdev(&dev.fdev);
+                  return -ENOMEM;
+            }
+            memcpy(fdev, &dev.fdev, sizeof(file_dev_t));
+
+            rcu_register_filedev(&devices, fdev);
+      }
 
       return 0;
 }
 
-// Remove a snapshot device from the registered snapshot devices. It is
-// used as a callback for the `rcu_compute_on_sdev` function.
-static int remove_sdev(snap_device *sdev, void *arg) {
-      if (!sdev) {
-            log_err("No snapshot device found for %s\n", sdev_name(sdev));
-            return -NOSDEV;
-      }
-      if (sdev->session) {
-            // Cannot remove snapshot device because it has an active session
-            log_err("Cannot remove snapshot device %s: active session\n",
-                    sdev_name(sdev));
-            return -SBUSY;
-      }
-      // Unregister the snapshot device
-      rcu_unregister_snapdevice(sdev);
-
-      // The free of `sdev` is demanded to the `rcu_compute_on_sdev` function
-      return SDEVREPLACE;
-}
-
-static int dealloc_snapdevice(const char *dev_name) {
-      device_t dev;
+static int unregister_device(const char *dev_name) {
+      generic_dev_t dev;
       int error;
 
-      error = get_bdev_by_name(dev_name, &dev);
+      error = get_dev_by_name(dev_name, &dev);
       if (error) {
             return error;
       }
-      error = rcu_compute_on_sdev(num_dev(&dev), NULL, remove_sdev);
-      dev_put(&dev);
-      if (error) {
-            return error;
+
+      switch (dev.type) {
+      case BDEV:
+            error = rcu_compute_on_sdev(&devices, num_dev(&dev.dev), NULL,
+                                        remove_sdev_callback);
+            put_dev(&dev.dev);
+            if (error) {
+                  return error;
+            }
+            break;
+
+      case FDEV:
+            error = rcu_compute_on_filedev(&devices, &dev.fdev, NULL,
+                                           remove_fdev_callback);
+            put_fdev(&dev.fdev);
+            if (error) {
+                  return error;
+            }
       }
 
       return 0;
@@ -400,11 +341,9 @@ void put_snapshot_path(void) {
       log_info("Snapshot path released\n");
 }
 
-// Create a new snapshot session on mount of a registered snapshot device. It is
-// used as a callback for the `rcu_compute_on_sdev` function.
-static int new_session_on_mount(snap_device *sdev, void *arg) {
-      struct dentry *mnt_dentry;
-      mnt_ref mnt;
+// Create a new snapshot session on mount of a registered snapshot device. It
+// is used as a callback for the `rcu_compute_on_sdev` function.
+static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
       snap_device *old_sdev, *new_sdev;
       snapshot_session *session;
       time64_t mount_timestamp;
@@ -413,50 +352,36 @@ static int new_session_on_mount(snap_device *sdev, void *arg) {
       if (!sdev) {
             return -NOSDEV;
       }
-      mnt_dentry = (struct dentry *)arg;
-      DEBUG_ASSERT(num_dev(&sdev->dev) == mnt_dentry->d_sb->s_bdev->bd_dev);
+
+      DEBUG_ASSERT(!sdev->session);
+
+      session = kmalloc(sizeof(snapshot_session), GFP_ATOMIC);
+      if (!session) {
+            return -ENOMEM;
+      }
+
+      mount_timestamp = ktime_get_real_seconds();
+      error = init_snapshot_session(session, mount_timestamp);
+      if (error) {
+            kfree(session);
+            return error;
+      }
 
       old_sdev = sdev;
-      new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+      new_sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
       if (!new_sdev) {
+            kfree(session);
             return -ENOMEM;
       }
       memcpy(new_sdev, old_sdev, sizeof(snap_device));
-
-      session = kmalloc(sizeof(snapshot_session), GFP_KERNEL);
-      if (!session) {
-            kfree(new_sdev);
-            return -ENOMEM;
-      }
-
-      // Holds a reference to the mount point to prevent unmounting while in
-      // use.
-      // Not incremented at session initialization, since `kill_block_super`
-      // can trigger a session cleanup; initializing with a ref would block
-      // unmount indefinitely.
-      mnt = INIT_MNT_REF(mnt_dentry);
-      mount_timestamp = ktime_get_real_seconds();
-
-      error = init_snapshot_session(session, sdev_name(new_sdev),
-                                    mount_timestamp, mnt);
-      if (error) {
-            AUDIT log_err("Failed to create new session for device %s : %d\n",
-                          sdev_name(new_sdev), error);
-            kfree(session);
-            kfree(new_sdev);
-            return error;
-      }
       new_sdev->session = session;
-      AUDIT log_info("New snapshot session created for device: %s\n",
-                     sdev_name(sdev));
 
       HLIST_RCU_REPLACE(old_sdev, new_sdev, devices_lock,
                         hash_dev(d_num(new_sdev)));
 
       dev_get(&new_sdev->dev);
-      // The free of `old_sdev` is demanded to the `rcu_compute_on_sdev`
-      // function
-      return SDEVREPLACE;
+
+      return FREE_SDEV;
 }
 
 static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
@@ -467,14 +392,16 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
       int error;
 
       // TODO: other kernel versions might return a block_device
-      mnt_dentry = (struct dentry *)regs_return_value(regs);
+      mnt_dentry = dget((struct dentry *)regs_return_value(regs));
       if (IS_ERR(mnt_dentry))
             goto ret_handler;
 
-      dev = mnt_dentry->d_sb->s_bdev->bd_dev;
-
-      // Don't really care about the error
-      rcu_compute_on_sdev(dev, mnt_dentry, new_session_on_mount);
+      if (mnt_dentry->d_sb->s_bdev) {
+            dev = mnt_dentry->d_sb->s_bdev->bd_dev;
+            // Don't really care about the error
+            rcu_compute_on_sdev(dev, NULL, new_session_on_mount_callback);
+      }
+      dput(mnt_dentry);
 
 ret_handler:
       return 0;
@@ -486,15 +413,16 @@ static struct kretprobe rp_mount = {
     .maxactive = KPROBE_MAX_ACTIVE,
 };
 
-// Callback function to clear the snapshot session on unmount.
-static int free_session_on_umount(snap_device *sdev, void *arg) {
+// Function to clear the snapshot session on unmount. It is used as a
+// callback for the `rcu_compute_on_sdev` function.
+static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
       snap_device *old_sdev, *new_sdev;
 
       if (!sdev)
             return -NOSDEV;
 
       old_sdev = sdev;
-      new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+      new_sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
       if (!new_sdev)
             return -ENOMEM;
 
@@ -502,8 +430,6 @@ static int free_session_on_umount(snap_device *sdev, void *arg) {
 
       // Set the session pointer to NULL to mark the unmount
       new_sdev->session = NULL;
-      AUDIT log_info("Snapshot session cleared for device: %s\n",
-                     sdev_name(sdev));
 
       // Replace the old snapshot device entry with the updated one
       HLIST_RCU_REPLACE(old_sdev, new_sdev, devices_lock,
@@ -511,7 +437,7 @@ static int free_session_on_umount(snap_device *sdev, void *arg) {
 
       dev_get(&new_sdev->dev);
 
-      return SDEVREPLACE;
+      return FREE_SDEV;
 }
 
 struct umount_data {
@@ -540,7 +466,7 @@ static int umount_ret_handler(struct kretprobe_instance *ri,
       dev_t dev = ud->dev;
 
       // Don't care about the error
-      rcu_compute_on_sdev(dev, NULL, free_session_on_umount);
+      rcu_compute_on_sdev(dev, NULL, free_session_on_umount_callback);
 
       return 0;
 }
@@ -553,14 +479,9 @@ static struct kretprobe rp_umount = {
     .maxactive = KPROBE_MAX_ACTIVE,
 };
 
-struct session_refs {
-      struct path snap_path;
-      mnt_ref mnt;
-};
-
-// Callback function used to retrieve the main session references for a snapshot
+// Callback function used to retrieve the session path for a snapshot
 // device. This is a helper function used within `rcu_compute_on_sdev`
-static int sdev_session_refs(snap_device *sdev, void *out) {
+static int sdev_session_path(snap_device *sdev, void *out) {
 
       if (!sdev) {
             return -NOSDEV;
@@ -568,17 +489,10 @@ static int sdev_session_refs(snap_device *sdev, void *out) {
       if (!sdev->session) {
             return -SDEVNOTACTIVE;
       }
-
-      struct session_refs *refs = (struct session_refs *)out;
-
-      mnt_ref mnt = session_mnt_get(sdev->session);
-      if (!has_dentry(&mnt)) {
-            return -NOMNTD;
-      }
+      struct path *path = (struct path *)out;
       struct path snap_path = session_path_get(sdev->session);
 
-      refs->snap_path = snap_path;
-      refs->mnt = mnt;
+      *path = snap_path;
 
       return 0;
 }
@@ -590,7 +504,7 @@ struct out_log {
 
 // Build the log that contains the original block data being overwritten
 static int build_block_log(struct inode *inode, loff_t offset, size_t count,
-                           struct session_refs *s_refs, struct out_log *out) {
+                           struct path snap_path, struct out_log *out) {
       struct super_block *sb;
       sector_t first_block, last_block, block;
       unsigned int blocksize;
@@ -606,7 +520,7 @@ static int build_block_log(struct inode *inode, loff_t offset, size_t count,
       blocksize = 1 << inode->i_blkbits;
       num_blocks = last_block - first_block + 1;
 
-      out->entries = kmalloc(num_blocks * sizeof(blog_entry *), GFP_KERNEL);
+      out->entries = kmalloc(num_blocks * sizeof(blog_entry *), GFP_ATOMIC);
       if (!out->entries)
             return -ENOMEM;
 
@@ -651,7 +565,6 @@ static int build_block_log(struct inode *inode, loff_t offset, size_t count,
             entry->block = block;
             entry->data_size = blocksize;
             entry->snap_path = s_refs->snap_path;
-            entry->mnt_ref = s_refs->mnt;
             memcpy(entry->orig_data, bh->b_data, blocksize);
 
             // Save the entry and cleanup buffer head
@@ -679,7 +592,7 @@ struct write_params {
 };
 
 static int pre_write_handler(struct write_params *params, struct out_log *log) {
-      struct session_refs s_refs;
+      struct path snap_path;
       int error;
 
       struct file *file = params->file;
@@ -688,16 +601,20 @@ static int pre_write_handler(struct write_params *params, struct out_log *log) {
       if (!file || !file->f_inode)
             return -EINVAL;
 
-      struct inode *inode = file->f_inode;
-      dev_t dev = inode->i_rdev;
-      struct super_block *sb = inode->i_sb;
+      struct inode *inode = igrab(file->f_inode);
+      if (!inode->i_sb->s_bdev) {
+            iput(inode);
+            return -NOSDEV;
+      }
+      dev_t dev = inode->i_sb->s_bdev->bd_dev;
 
       // If the snapshot device is not registered, it simply returns an error
-      error = rcu_compute_on_sdev(dev, &s_refs, sdev_session_refs);
+      error = rcu_compute_on_sdev(dev, &snap_path, sdev_session_path);
       if (error) {
+            iput(inode);
             return error;
       }
-      error = build_block_log(inode, offset, count, &s_refs, log);
+      error = build_block_log(inode, offset, count, snap_path, log);
 
       return error;
 }
@@ -769,8 +686,8 @@ int activate_snapshot(const char *dev_name, const char *passwd) {
             return -AUTHF;
       }
       AUDIT log_info("Password verified succesfully\n");
-      // Tries to allocate a new snapshot device
-      error = alloc_snapdevice(dev_name);
+      // Tries to register a new device
+      error = register_device(dev_name);
       if (error) {
             return error;
       }

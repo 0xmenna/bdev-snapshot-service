@@ -17,6 +17,7 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 
+#include "hlist_rcu.h"
 #include "utils.h"
 
 #define COMMITTED_HASH_BITS 16
@@ -25,29 +26,35 @@
 #define NODEV 1
 #define DEXIST 2
 #define NOSDEV 3
-#define SDEVREPLACE 4
-#define AUTHF 5
-#define SBUSY 6
-#define MODUNLOAD 7
-#define SESSIONOVFLW 8
-#define SDEVNOTACTIVE 9
-#define NOPHYSBLOCK 10
-#define NOBHEAD 11
-#define NOMNTD 12
+#define AUTHF 4
+#define SBUSY 5
+#define MODUNLOAD 6
+#define SESSIONOVFLW 7
+#define SDEVNOTACTIVE 8
+#define NOPHYSBLOCK 9
+#define NOBHEAD 10
+#define NOMNTD 11
+#define PATHEXIST 12
+#define FREE_SDEV 13
+#define FREE_SDEV_NO_SESSION 14
+#define SNAPDIR_EXIST 15
+#define FREE_RCU 16
 
 #define AUDIT if (1)
 
-typedef struct sessions {
-      atomic_t session_id;
-      enum { OVERFLOW, OK } status;
-} sessions_t;
+struct snapshot_devices {
+      // Registered devices that are mapped to an actual block device (i.e. a
+      // snapshot device is a registered block device to the snapshot subsystem)
+      struct hlist_head sdevices[1 << HASH_BITS];
+      // Locks for the registered devices buckets
+      spinlock_t s_locks[1 << HASH_BITS];
+      // Registered device-files
+      struct list_head fdevices;
+      // Lock for the `fdevices` list
+      spinlock_t f_lock;
+};
 
-#define DECLARE_SESSIONS(name)                                                 \
-      sessions_t name = {                                                      \
-          .session_id = ATOMIC_INIT(0),                                        \
-          .status = OK,                                                        \
-      }
-
+// A device mapped to an actual block device
 typedef struct _device {
       // In more recent kernels to work with block devices, we use vfs related
       // structures.
@@ -56,51 +63,146 @@ typedef struct _device {
       struct dentry *dentry;
 } device_t;
 
-static inline struct dentry *d_dev(device_t *device) { return device->dentry; }
-
-static inline struct inode *i_dev(device_t *device) {
-      return device->dentry->d_inode;
+static inline const char *devname(device_t *dev) {
+      return dev->dentry->d_name.name;
 }
 
-static inline dev_t num_dev(device_t *device) {
-      struct inode *inode = d_backing_inode(device->dentry);
+static inline struct dentry *d_dev(device_t *dev) { return dev->dentry; }
+
+static inline struct inode *i_dev(device_t *dev) {
+      return dev->dentry->d_inode;
+}
+
+static inline dev_t num_dev(device_t *dev) {
+      struct inode *inode = i_dev(dev);
       return inode->i_rdev;
 }
 
-static inline void dev_put(device_t *device) { dput(device->dentry); }
+static inline void put_dev(device_t *dev) { dput(dev->dentry); }
 
-static inline void dev_get(device_t *device) { dget(device->dentry); }
+static inline void dev_get(device_t *dev) { dget(dev->dentry); }
 
-static inline void INIT_DEV(device_t *device, struct dentry *dentry) {
-      device->dentry = dget(dentry);
+static inline void INIT_DEV(device_t *dev, struct dentry *dentry) {
+      dev->dentry = dget(dentry);
 }
 
-typedef struct _mnt_ref {
+// A device-file
+typedef struct _file_dev {
       struct dentry *dentry;
-} mnt_ref;
+      bool is_mapped;
+      struct list_head node;
+      struct rcu_head rcu;
+} file_dev_t;
 
-static inline mnt_ref INIT_MNT_REF(struct dentry *dentry) {
-      mnt_ref ref;
-
-      ref.dentry = dentry;
-      return ref;
+static inline void INIT_FDEV(file_dev_t *fdev, struct dentry *dentry) {
+      fdev->dentry = dget(dentry);
+      fdev->is_mapped = false;
+      INIT_LIST_HEAD(&fdev->node);
 }
 
-static inline void mnt_ref_put(mnt_ref *ref) { dput(ref->dentry); }
+static inline void put_fdev(file_dev_t *fdev) { dput(fdev->dentry); }
 
-static inline mnt_ref mnt_ref_get(mnt_ref *ref) {
-      mnt_ref new_ref;
+static void rcu_register_filedev(struct snapshot_devices *devices,
+                                 file_dev_t *fdev) {
+      spin_lock(&devices->f_lock);
+      list_add_rcu(&fdev->node, &devices->fdevices);
+      spin_unlock(&devices->f_lock);
 
-      new_ref.dentry = dget(ref->dentry);
-      return new_ref;
+      return 0;
 }
 
-static inline bool has_dentry(mnt_ref *ref) { return ref->dentry != NULL; }
+static void rcu_unregister_filedev(struct snapshot_devices *devices,
+                                   file_dev_t *fdev) {
+      spin_lock(&devices->f_lock);
+      list_del_rcu(&fdev->node);
+      spin_unlock(&devices->f_lock);
+}
+
+static inline void put_fdev_callback(struct rcu_head *rcu) {
+      file_dev_t *fdev = container_of(rcu, file_dev_t, rcu);
+
+      put_fdev(fdev);
+}
+
+// Callback function that checks wheter a device-file is already registered.
+// Used within the `rcu_compute_on_filedev` function.
+static inline int no_file_dev_callback(file_dev_t *fdev, void *arg) {
+      if (fdev != NULL) {
+            return -DEXIST;
+      }
+      return 0;
+}
+
+// Remove a device-file from the registered devices. It is
+// used as a callback for the `rcu_compute_on_filedev` function.
+static int remove_fdev_callback(struct snapshot_devices *devices,
+                                file_dev_t *fdev, void *arg) {
+      if (!fdev) {
+            log_err("No device-file found for %s\n", fdev->dentry->d_name.name);
+            return -NOSDEV;
+      }
+      if (fdev->is_mapped) {
+            // Cannot remove device file because it is mapped to a block device
+            // (i.e. has an active session)
+            log_err("Cannot remove device-file %s: active session\n",
+                    fdev->dentry->d_name.name);
+            return -SBUSY;
+      }
+      // Unregister the device
+      rcu_unregister_filedev(devices, fdev);
+
+      // The free of `fdev` is demanded to the `rcu_compute_on_filedev` function
+      return FREE_RCU;
+}
+
+// Computes a function on a device-file. It looks up the device and calls the
+// compute function on the found device (it follows RCU based "locking").
+static int rcu_compute_on_filedev(struct snapshot_devices *devices,
+                                  file_dev_t *lookup_fdev, void *arg,
+                                  int (*compute_f)(file_dev_t *, void *)) {
+
+      file_dev_t *fdev, *found_fdev = NULL;
+      struct inode *fdev_inode = NULL;
+      int ret;
+
+      struct inode *lookup_inode = d_inode(lookup_fdev->dentry);
+
+      rcu_read_lock();
+      list_for_each_entry(fdev, &devices->fdevices, node) {
+            fdev_inode = d_inode(fdev->dentry);
+            if (fdev_inode->i_ino == lookup_inode->i_ino &&
+                fdev_inode->i_sb == lookup_inode->i_sb) {
+                  found_fdev = fdev;
+                  break;
+            }
+      }
+      ret = compute_f(found_fdev, arg);
+      rcu_read_unlock();
+
+      if (ret == FREE_RCU) {
+#ifdef ASYNC
+            // Suited for atomic context
+            call_rcu(&fdev->rcu, put_fdev_callback);
+#else
+            // Never activate this when executing in atomic context
+            sychronize_rcu();
+            put_fdev(fdev);
+#endif
+            ret = 0;
+      }
+
+      return ret;
+}
+
+typedef struct generic_dev {
+      enum { BDEV, FDEV } type;
+      union {
+            device_t dev;
+            file_dev_t fdev;
+      };
+} generic_dev_t;
 
 /**
- * struct snapshot_session - Represents an active snapshot session.
- * @mnt_ref:       Reference to the mount point of the file system being
- * snapshotted.
  * @session_id:  Unique session identifier.
  * @mount_timestamp:  Unix timestamp (u64) when the session was activated.
  * @snap_path:    Snapshot directory path (e.g.,
@@ -111,63 +213,50 @@ static inline bool has_dentry(mnt_ref *ref) { return ref->dentry != NULL; }
  *
  */
 typedef struct _snapshot_session {
-      mnt_ref mnt;
-      int session_id;
       u64 mount_timestamp;
       struct path snap_path;
       struct hlist_head committed_blocks[1 << COMMITTED_HASH_BITS];
       spinlock_t locks[1 << COMMITTED_HASH_BITS];
 } snapshot_session;
 
+static inline int init_snapshot_session(snapshot_session *snap_session,
+                                        time64_t timestamp) {
+
+      snap_session->snap_path.dentry = NULL;
+      snap_session->snap_path.mnt = NULL;
+      snap_session->mount_timestamp = timestamp;
+
+      return 0;
+}
+
 static inline struct path session_path_get(snapshot_session *session) {
+      if (session->snap_path.dentry == NULL) {
+            goto ret_path;
+      }
       path_get(&session->snap_path);
+
+ret_path:
       return session->snap_path;
 }
 
 static inline void session_path_put(snapshot_session *session) {
+      if (session->snap_path.dentry == NULL) {
+            return;
+      }
       path_put(&session->snap_path);
 }
 
-static inline mnt_ref session_mnt_get(snapshot_session *session) {
-      return mnt_ref_get(&session->mnt);
+static inline struct dentry *d_session(snapshot_session *session) {
+      return session->snap_path.dentry;
 }
-
-static inline void session_mnt_put(snapshot_session *session) {
-      mnt_ref_put(&session->mnt);
-}
-
-struct committed_block {
-      sector_t block;
-      struct hlist_node hnode;
-};
-
-/**
- * struct block_log_entry - Represents a logged block modification.
- * @snap_path:   Identifies the snapshot path within an active session.
- * @mnt_ref:    Reference to the mount point of the file system associated to
- * the data being handled. It is needed to avoid the umounting while entries
- * must still be processed.
- * @block: Block (or sector) offset on the device.
- * @orig_data:    Pointer to a copy of the original block data.
- * @data_size:    Size in bytes of the block.
- *
- * Each entry records the original content of a modified block.
- */
-typedef struct block_log_entry {
-      struct path snap_path;
-      mnt_ref mnt_ref;
-      sector_t block;
-      char *orig_data;
-      size_t data_size;
-} blog_entry;
 
 /**
  * struct snap_device - Represents a block device registered to the snapshot
  * subsystem.
  * @device: Device number.
  * @snapshot_session Pointer to the active snapshot session.
- * @hnode: Hash list node for linking this device in the registered devices
- * table.
+ * @hnode: Hash list node for linking this device in the registered devices that
+ * are mapped to a block device table.
  * @rcu: RCU head for safe removal of this device from the registered devices
  */
 typedef struct _snap_device {
@@ -182,7 +271,7 @@ static inline device_t dev(snap_device *sdev) { return sdev->dev; }
 extern inline dev_t d_num(snap_device *sdev) { return num_dev(&sdev->dev); }
 
 static inline const char *sdev_name(snap_device *sdev) {
-      return sdev->dev.dentry->d_name.name;
+      return devname(&sdev->dev);
 }
 
 static inline u32 hash_dev(dev_t dev) { return hash_32(dev, HASH_BITS); }
@@ -191,6 +280,176 @@ static inline void INIT_SNAP_DEVICE(snap_device *sdev, device_t device) {
       sdev->dev = device;
       sdev->session = NULL;
       INIT_HLIST_NODE(&sdev->hnode);
+}
+
+// Free a snapshot device, but without freeing the session. It must be used in
+// RCU context
+static inline void free_sdev_no_session(snap_device *sdev) {
+      dev_put(&sdev->dev);
+
+      kfree(sdev);
+}
+
+// Free a snapshot device and its session
+static void free_sdev(snap_device *sdev) {
+      if (sdev->session) {
+            snapshot_session *session = sdev->session;
+            int i;
+
+            // Release the reference held by snap_path
+            path_put(&session->snap_path);
+
+            // Free all allocated committed blocks
+            for (i = 0; i < (1 << COMMITTED_HASH_BITS); i++) {
+                  struct committed_block *cb;
+                  struct hlist_node *tmp;
+                  hlist_for_each_entry_safe(
+                      cb, tmp, &session->committed_blocks[i], hnode) {
+                        hlist_del(&cb->hnode);
+                        kfree(cb);
+                  }
+            }
+            kfree(session);
+      }
+
+      free_sdev_no_session(sdev);
+}
+
+// Callback to free a snapshot device without its session within async RCU
+// context
+static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
+      snap_device *sdev = container_of(rcu, snap_device, rcu);
+
+      AUDIT log_info(
+          "Callback free (no session): device : %s, preempt_count : %d\n",
+          sdev_name(sdev), preempt_count());
+
+      free_sdev_no_session(sdev);
+}
+
+// Callback to free a snapshot device and its session within async RCU context
+static inline void free_sdev_callback(struct rcu_head *rcu) {
+      snap_device *sdev = container_of(rcu, snap_device, rcu);
+
+      AUDIT log_info("Callback free: device : %s, preempt_count : %d\n",
+                     sdev_name(sdev), preempt_count());
+
+      free_sdev(sdev);
+}
+
+// Add a snapshot device to the registered devices
+static inline void rcu_register_snapdevice(struct snapshot_devices *devices,
+                                           snap_device *sdev) {
+      u32 hash = hash_dev(d_num(sdev));
+
+      HLIST_RCU_INSERT(sdev, devices->sdevices, devices->s_locks, hash);
+
+      log_info("New Device %s registered\n", sdev_name(sdev));
+}
+
+// Remove a snapshot device from the registered devices
+static inline void rcu_unregister_snapdevice(struct snapshot_devices *devices,
+                                             snap_device *sdev) {
+      u32 hash = hash_dev(d_num(sdev));
+
+      HLIST_RCU_REMOVE(sdev, devices->s_locks, hash);
+
+      log_info("Device %s unregistered\n", sdev_name(sdev));
+}
+
+// Remove a snapshot device from the registered snapshot devices. It is
+// used as a callback for the `rcu_compute_on_sdev` function.
+static int remove_sdev_callback(struct snapshot_devices *devices,
+                                snap_device *sdev, void *arg) {
+      if (!sdev) {
+            log_err("No snapshot device found for %s\n", sdev_name(sdev));
+            return -NOSDEV;
+      }
+      if (sdev->session) {
+            // Cannot remove snapshot device because it has an active session
+            log_err("Cannot remove snapshot device %s: active session\n",
+                    sdev_name(sdev));
+            return -SBUSY;
+      }
+      // Unregister the snapshot device
+      rcu_unregister_snapdevice(devices, sdev);
+
+      // The free of `sdev` is demanded to the `rcu_compute_on_sdev` function
+      return FREE_SDEV;
+}
+
+// Computes a function on a snapshot device. It looks up the device by its
+// `dev_t` identifier and calls the function following RCU based "locking".
+static inline int rcu_compute_on_sdev(struct snapshot_devices *devices,
+                                      dev_t dev, void *arg,
+                                      int (*compute_f)(snap_device *, void *)) {
+      int ret;
+      snap_device *sdev = HLIST_RCU_LOOKUP(dev, hash_dev, devices->sdevices,
+                                           snap_device, d_num);
+
+      ret = compute_f(sdev, arg);
+      HLIST_RCU_READ_UNLOCK();
+
+      if (ret == FREE_SDEV) {
+#ifdef ASYNC
+            // Suited for atomic context
+            call_rcu(&sdev->rcu, free_sdev_callback);
+#else
+            // Never activate this when executing in atomic context
+            sychronize_rcu();
+            free_sdev(sdev);
+#endif
+            ret = 0;
+      } else if (ret == FREE_SDEV_NO_SESSION) {
+#ifdef ASYNC
+            call_rcu(&sdev->rcu, free_sdev_no_session_callback);
+#else
+            sychronize_rcu();
+            free_sdev_no_session(sdev);
+#endif
+            ret = 0;
+      }
+
+      return ret;
+}
+
+struct committed_block {
+      sector_t block;
+      struct hlist_node hnode;
+};
+
+/**
+ * struct block_log_entry - Represents a logged block modification.
+ * @snap_path:   Identifies the snapshot path within an active session.
+ * @inode:      Pointer to the inode of the file being modified. Useful to
+ * retrieve the underlying device name and to mantain a reference to avoid the
+ * associated fs to be unmounted.
+ * @block: Block (or sector) offset on the device.
+ * @orig_data:    Pointer to a copy of the original block data.
+ * @data_size:    Size in bytes of the block.
+ *
+ * Each entry records the original content of a modified block.
+ */
+typedef struct block_log_entry {
+      struct path snap_path;
+      struct inode *inode;
+      sector_t block;
+      char *orig_data;
+      size_t data_size;
+} blog_entry;
+
+static inline void d_path_blog_entry(blog_entry *entry) {
+      return entry->snap_path.dentry;
+}
+
+static inline void free_blog_entry(blog_entry *entry) {
+      if (entry->orig_data) {
+            kfree(entry->orig_data);
+      }
+      if (entry->inode) {
+            iput(entry->inode);
+      }
+      path_put(&entry->snap_path);
 }
 
 /**
