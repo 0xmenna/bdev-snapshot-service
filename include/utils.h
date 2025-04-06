@@ -4,9 +4,13 @@
 
 #include <crypto/hash.h>
 #include <linux/err.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/root_dev.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
+#include <linux/vmalloc.h>
 
 #define MAX_SECRET_LEN 64
 #define MAX_DEV_PATH 1024

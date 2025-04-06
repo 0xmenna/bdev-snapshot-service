@@ -85,7 +85,6 @@ unload_bdev_snapshot:
 create_testing_fs:
 	dd bs=4096 count=100 if=/dev/zero of=tests/singlefile_fs/image
 	./tests/singlefile_fs/singlefilemakefs tests/singlefile_fs/image
-	sudo losetup /dev/loop0 tests/singlefile_fs/image
 	mkdir /tmp/mnt
 
 rm_testing_fs:
@@ -100,7 +99,7 @@ unload_testing_fs_driver:
 	$(call rmm_module,tests/singlefile_fs/singlefilefs.ko)
 
 mount_testing_fs:
-	sudo mount -t singlefilefs /dev/loop0 /tmp/mnt
+	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image /tmp/mnt
 
 umount_testing_fs:
 	sudo umount /tmp/mnt

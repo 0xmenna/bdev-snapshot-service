@@ -47,8 +47,6 @@ TAGS
 *.pyc
 __pycache__/
 
-.vscode/
-
 # Project related
 usctm/
 tests/singlefile_fs/image

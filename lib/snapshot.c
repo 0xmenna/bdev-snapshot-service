@@ -49,16 +49,15 @@
       } while (0)
 #endif
 
+#define LO_BACKING_FILE_OFFSET 224
+
 // Global parent path for snapshot directories
 static struct path snapshot_root_path;
-
-// Registered devices to the snapshot subsystem
-static struct snapshot_devices devices;
 
 // Per-CPU block log FIFO
 static DEFINE_PER_CPU(block_fifo, cpu_block_fifo);
 
-static inline bool may_open_dev(const struct path *path) {
+static inline bool may_open_device(const struct path *path) {
       return !(path->mnt->mnt_flags & MNT_NODEV) &&
              !(path->mnt->mnt_sb->s_iflags & SB_I_NODEV);
 }
@@ -89,12 +88,12 @@ static int get_dev_by_name(const char *pathname, generic_dev_t *dev) {
             goto out_path_put;
       }
       error = -EACCES;
-      if (!may_open_dev(&path))
+      if (!may_open_device(&path))
             goto out_path_put;
 
       // An actual block device
       device_t bdev;
-      INIT_DEV(&dev, path.dentry);
+      INIT_DEV(&dev->dev, path.dentry);
       dev->type = BDEV;
       dev->dev = bdev;
 
@@ -148,7 +147,7 @@ static int session_path_callback(snap_device *sdev, void *arg) {
       }
 
       // Create the new directory
-      ret = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
+      ret = vfs_mkdir(snapshot_root_path.mnt->mnt_userns,
                       d_inode(snapshot_root_path.dentry), subdentry, 0500);
       if (ret) {
             if (ret == -EEXIST) {
@@ -179,7 +178,7 @@ static int session_path_callback(snap_device *sdev, void *arg) {
             goto out;
       }
 
-      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices_lock,
+      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
                         hash_dev(d_num(new_sdev)));
 
       dev_get(&new_sdev->dev);
@@ -191,16 +190,6 @@ out:
       dput(subdentry);
       return ret;
 };
-
-// Helper function to check if a snapshot device is not registered. It
-// is used as a callback for the `rcu_compute_on_sdev` function.
-static inline int no_sdev_callback(snap_device *sdev, void *arg) {
-      if (sdev != NULL) {
-            return -DEXIST;
-      } else {
-            return 0;
-      }
-}
 
 static int register_device(const char *dev_name) {
       generic_dev_t dev;
@@ -218,8 +207,8 @@ static int register_device(const char *dev_name) {
             snap_device tmp_sdev, *sdev;
             INIT_SNAP_DEVICE(&tmp_sdev, dev.dev);
             // Check if the snapshot device is already registered
-            error = rcu_compute_on_sdev(&devices, d_num(&tmp_sdev), NULL,
-                                        no_sdev_callback);
+            error =
+                rcu_compute_on_sdev(d_num(&tmp_sdev), NULL, no_sdev_callback);
             if (error) {
                   put_dev(&tmp_sdev.dev);
                   AUDIT log_err("Device %s is already registered\n",
@@ -235,12 +224,12 @@ static int register_device(const char *dev_name) {
             memcpy(sdev, &tmp_sdev, sizeof(snap_device));
 
             // Register the snapshot device
-            rcu_register_snapdevice(&devices, sdev);
+            rcu_register_snapdevice(sdev);
             break;
       case FDEV:
             // Check if the device file is already registered
-            error = rcu_compute_on_filedev(&devices, &dev.fdev, NULL,
-                                           no_file_dev_callback);
+            error =
+                rcu_compute_on_filedev(&dev.fdev, NULL, no_file_dev_callback);
             if (error) {
                   put_fdev(&dev.fdev);
                   AUDIT log_err("Device file %s is already registered\n",
@@ -255,7 +244,7 @@ static int register_device(const char *dev_name) {
             }
             memcpy(fdev, &dev.fdev, sizeof(file_dev_t));
 
-            rcu_register_filedev(&devices, fdev);
+            rcu_register_filedev(fdev);
       }
 
       return 0;
@@ -272,7 +261,7 @@ static int unregister_device(const char *dev_name) {
 
       switch (dev.type) {
       case BDEV:
-            error = rcu_compute_on_sdev(&devices, num_dev(&dev.dev), NULL,
+            error = rcu_compute_on_sdev(num_dev(&dev.dev), NULL,
                                         remove_sdev_callback);
             put_dev(&dev.dev);
             if (error) {
@@ -281,8 +270,8 @@ static int unregister_device(const char *dev_name) {
             break;
 
       case FDEV:
-            error = rcu_compute_on_filedev(&devices, &dev.fdev, NULL,
-                                           remove_fdev_callback);
+            error =
+                rcu_compute_on_filedev(&dev.fdev, NULL, remove_fdev_callback);
             put_fdev(&dev.fdev);
             if (error) {
                   return error;
@@ -317,7 +306,7 @@ int init_snapshot_path(void) {
             goto cleanup_root;
       }
 
-      error = vfs_mkdir(root_path.mnt->mnt_idmap, root_path.dentry->d_inode,
+      error = vfs_mkdir(root_path.mnt->mnt_userns, d_inode(root_path.dentry),
                         dentry, 0500);
       if (error)
             goto cleanup_all;
@@ -376,7 +365,7 @@ static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
       memcpy(new_sdev, old_sdev, sizeof(snap_device));
       new_sdev->session = session;
 
-      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices_lock,
+      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
                         hash_dev(d_num(new_sdev)));
 
       dev_get(&new_sdev->dev);
@@ -391,15 +380,26 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
       snap_device *sdev;
       int error;
 
-      // TODO: other kernel versions might return a block_device
       mnt_dentry = dget((struct dentry *)regs_return_value(regs));
       if (IS_ERR(mnt_dentry))
             goto ret_handler;
 
       if (mnt_dentry->d_sb->s_bdev) {
-            dev = mnt_dentry->d_sb->s_bdev->bd_dev;
-            // Don't really care about the error
-            rcu_compute_on_sdev(dev, NULL, new_session_on_mount_callback);
+            struct block_device *bdev = mnt_dentry->d_sb->s_bdev;
+            if (MAJOR(bdev->bd_dev) == LOOP_MAJOR) {
+                  // Extract the backing file of the loop device
+                  struct file *lo_backing_file =
+                      *(struct file **)((char *)bdev->bd_disk->private_data +
+                                        LO_BACKING_FILE_OFFSET);
+                  log_info("The backing file of the loop device is: %s",
+                           lo_backing_file->f_path.dentry->d_name.name);
+            } else {
+                  // A regular block device
+
+                  // Don't really care about the error
+                  rcu_compute_on_sdev(bdev->bd_dev, NULL,
+                                      new_session_on_mount_callback);
+            }
       }
       dput(mnt_dentry);
 
@@ -410,7 +410,6 @@ ret_handler:
 static struct kretprobe rp_mount = {
     .kp.symbol_name = "mount_bdev",
     .handler = mount_bdev_ret_handler,
-    .maxactive = KPROBE_MAX_ACTIVE,
 };
 
 // Function to clear the snapshot session on unmount. It is used as a
@@ -432,7 +431,7 @@ static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
       new_sdev->session = NULL;
 
       // Replace the old snapshot device entry with the updated one
-      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices_lock,
+      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
                         hash_dev(d_num(new_sdev)));
 
       dev_get(&new_sdev->dev);
@@ -476,7 +475,6 @@ static struct kretprobe rp_umount = {
     .entry_handler = umount_entry_handler,
     .handler = umount_ret_handler,
     .data_size = sizeof(struct umount_data),
-    .maxactive = KPROBE_MAX_ACTIVE,
 };
 
 // Callback function used to retrieve the session path for a snapshot
@@ -497,158 +495,158 @@ static int sdev_session_path(snap_device *sdev, void *out) {
       return 0;
 }
 
-struct out_log {
-      blog_entry **entries;
-      u32 num_entries;
-};
+// struct out_log {
+//       blog_entry **entries;
+//       u32 num_entries;
+// };
 
 // Build the log that contains the original block data being overwritten
-static int build_block_log(struct inode *inode, loff_t offset, size_t count,
-                           struct path snap_path, struct out_log *out) {
-      struct super_block *sb;
-      sector_t first_block, last_block, block;
-      unsigned int blocksize;
-      struct buffer_head *bh = NULL;
-      int num_blocks, index = 0;
-      int error;
+// static int build_block_log(struct inode *inode, loff_t offset, size_t count,
+//                            struct path snap_path, struct out_log *out) {
+//       struct super_block *sb;
+//       sector_t first_block, last_block, block;
+//       unsigned int blocksize;
+//       struct buffer_head *bh = NULL;
+//       int num_blocks, index = 0;
+//       int error;
 
-      // Compute block range
-      first_block = offset >> inode->i_blkbits;
-      last_block = (offset + count - 1) >> inode->i_blkbits;
-      DEBUG_ASSERT(first_block <= last_block);
+//       // Compute block range
+//       first_block = offset >> inode->i_blkbits;
+//       last_block = (offset + count - 1) >> inode->i_blkbits;
+//       DEBUG_ASSERT(first_block <= last_block);
 
-      blocksize = 1 << inode->i_blkbits;
-      num_blocks = last_block - first_block + 1;
+//       blocksize = 1 << inode->i_blkbits;
+//       num_blocks = last_block - first_block + 1;
 
-      out->entries = kmalloc(num_blocks * sizeof(blog_entry *), GFP_ATOMIC);
-      if (!out->entries)
-            return -ENOMEM;
+//       out->entries = kmalloc(num_blocks * sizeof(blog_entry *), GFP_ATOMIC);
+//       if (!out->entries)
+//             return -ENOMEM;
 
-      for (int i = 0; i < num_blocks; i++)
-            out->entries[i] = NULL;
+//       for (int i = 0; i < num_blocks; i++)
+//             out->entries[i] = NULL;
 
-      sb = inode->i_sb;
+//       sb = inode->i_sb;
 
-      // Process each block in the range
-      for (block = first_block; block <= last_block; block++) {
-            blog_entry *entry = NULL;
-            sector_t phys_block = bmap(inode, block);
+//       // Process each block in the range
+//       for (block = first_block; block <= last_block; block++) {
+//             blog_entry *entry = NULL;
+//             sector_t phys_block = bmap(inode, block);
 
-            if (!phys_block) {
-                  error = -NOPHYSBLOCK;
-                  goto cleanup;
-            }
+//             if (!phys_block) {
+//                   error = -NOPHYSBLOCK;
+//                   goto cleanup;
+//             }
 
-            bh = sb_bread(sb, phys_block);
-            if (!bh) {
-                  AUDIT log_err("Failed to read block %llu\n",
-                                (unsigned long long)phys_block);
-                  error = -NOBHEAD;
-                  goto cleanup;
-            }
-            DEBUG_ASSERT(bh->b_size == blocksize);
+//             bh = sb_bread(sb, phys_block);
+//             if (!bh) {
+//                   AUDIT log_err("Failed to read block %llu\n",
+//                                 (unsigned long long)phys_block);
+//                   error = -NOBHEAD;
+//                   goto cleanup;
+//             }
+//             DEBUG_ASSERT(bh->b_size == blocksize);
 
-            entry = kmalloc(sizeof(blog_entry), GFP_KERNEL);
-            if (!entry) {
-                  error = -ENOMEM;
-                  goto cleanup;
-            }
+//             entry = kmalloc(sizeof(blog_entry), GFP_KERNEL);
+//             if (!entry) {
+//                   error = -ENOMEM;
+//                   goto cleanup;
+//             }
 
-            entry->orig_data = kmalloc(blocksize, GFP_KERNEL);
-            if (!entry->orig_data) {
-                  kfree(entry);
-                  error = -ENOMEM;
-                  goto cleanup;
-            }
+//             entry->orig_data = kmalloc(blocksize, GFP_KERNEL);
+//             if (!entry->orig_data) {
+//                   kfree(entry);
+//                   error = -ENOMEM;
+//                   goto cleanup;
+//             }
 
-            // Store block information
-            entry->block = block;
-            entry->data_size = blocksize;
-            entry->snap_path = s_refs->snap_path;
-            memcpy(entry->orig_data, bh->b_data, blocksize);
+//             // Store block information
+//             entry->block = block;
+//             entry->data_size = blocksize;
+//             entry->snap_path = s_refs->snap_path;
+//             memcpy(entry->orig_data, bh->b_data, blocksize);
 
-            // Save the entry and cleanup buffer head
-            out->entries[index++] = entry;
-            brelse(bh);
-            bh = NULL;
-      }
-      out->num_entries = num_blocks;
+//             // Save the entry and cleanup buffer head
+//             out->entries[index++] = entry;
+//             brelse(bh);
+//             bh = NULL;
+//       }
+//       out->num_entries = num_blocks;
 
-      return 0;
+//       return 0;
 
-cleanup:
-      if (bh)
-            brelse(bh);
-      for (int i = 0; i < index; i++)
-            kfree(out->entries[i]);
-      kfree(out->entries);
-      return error;
-}
+// cleanup:
+//       if (bh)
+//             brelse(bh);
+//       for (int i = 0; i < index; i++)
+//             kfree(out->entries[i]);
+//       kfree(out->entries);
+//       return error;
+// }
 
-struct write_params {
-      struct file *file;
-      loff_t offset;
-      size_t count;
-};
+// struct write_params {
+//       struct file *file;
+//       loff_t offset;
+//       size_t count;
+// };
 
-static int pre_write_handler(struct write_params *params, struct out_log *log) {
-      struct path snap_path;
-      int error;
+// static int pre_write_handler(struct write_params *params, struct out_log
+// *log) {
+//       struct path snap_path;
+//       int error;
 
-      struct file *file = params->file;
-      loff_t offset = params->offset;
-      size_t count = params->count;
-      if (!file || !file->f_inode)
-            return -EINVAL;
+//       struct file *file = params->file;
+//       loff_t offset = params->offset;
+//       size_t count = params->count;
+//       if (!file || !file->f_inode)
+//             return -EINVAL;
 
-      struct inode *inode = igrab(file->f_inode);
-      if (!inode->i_sb->s_bdev) {
-            iput(inode);
-            return -NOSDEV;
-      }
-      dev_t dev = inode->i_sb->s_bdev->bd_dev;
+//       struct inode *inode = igrab(file->f_inode);
+//       if (!inode->i_sb->s_bdev) {
+//             iput(inode);
+//             return -NOSDEV;
+//       }
+//       dev_t dev = inode->i_sb->s_bdev->bd_dev;
 
-      // If the snapshot device is not registered, it simply returns an error
-      error = rcu_compute_on_sdev(dev, &snap_path, sdev_session_path);
-      if (error) {
-            iput(inode);
-            return error;
-      }
-      error = build_block_log(inode, offset, count, snap_path, log);
+//       // If the snapshot device is not registered, it simply returns an error
+//       error = rcu_compute_on_sdev(dev, &snap_path, sdev_session_path);
+//       if (error) {
+//             iput(inode);
+//             return error;
+//       }
+//       error = build_block_log(inode, offset, count, snap_path, log);
 
-      return error;
-}
+//       return error;
+// }
 
-static int vfs_write_entry_handler(struct kretprobe_instance *ri,
-                                   struct pt_regs *regs) {
-      struct out_log *log = (struct out_log *)ri->data;
-      struct write_params params;
-      int error;
-#ifdef CONFIG_X86_64
-      params.file = (struct file *)regs->di;
-      params.count = (size_t)regs->dx;
-      params.offset = (loff_t *)regs->cx;
+// static int vfs_write_entry_handler(struct kretprobe_instance *ri,
+//                                    struct pt_regs *regs) {
+//       struct out_log *log = (struct out_log *)ri->data;
+//       struct write_params params;
+//       int error;
+// #ifdef CONFIG_X86_64
+//       params.file = (struct file *)regs->di;
+//       params.count = (size_t)regs->dx;
+//       params.offset = (loff_t *)regs->cx;
 
-      error = pre_write_handler(&params, log);
-      if (error) {
-            return -1;
-      }
+//       error = pre_write_handler(&params, log);
+//       if (error) {
+//             return -1;
+//       }
 
-      return 0;
-#else
-#error "Unsupported architecture"
-#endif
-}
+//       return 0;
+// #else
+// #error "Unsupported architecture"
+// #endif
+// }
 
-static struct kretprobe rp_vfs_write = {
-    .kp.symbol_name = "vfs_write",
-    .entry_handler = vfs_write_entry_handler,
-    // TODO .handler = vfs_write_ret_handler,
-    .data_size = sizeof(struct out_log),
-    .maxactive = KPROBE_MAX_ACTIVE,
-};
+// static struct kretprobe rp_vfs_write = {
+//     .kp.symbol_name = "vfs_write",
+//     .entry_handler = vfs_write_entry_handler,
+//     // TODO .handler = vfs_write_ret_handler,
+//     .data_size = sizeof(struct out_log),
+// };
 
-static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write};
+static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount};
 
 int register_my_kretprobes(void) {
       int i, ret;
@@ -711,7 +709,7 @@ int deactivate_snapshot(const char *dev_name, const char *passwd) {
       }
 
       // Tries to deallocate the snapshot device
-      error = dealloc_snapdevice(dev_name);
+      error = unregister_device(dev_name);
       if (error) {
             return error;
       }
