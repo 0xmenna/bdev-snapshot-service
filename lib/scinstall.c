@@ -1,3 +1,7 @@
+#include <linux/module.h>
+
+#ifdef CONFIG_X86
+
 #include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
@@ -10,7 +14,6 @@
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/list.h>
-#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/signal.h>
@@ -27,8 +30,6 @@
 #include "../include/scth.h"
 #include "../include/snapshot.h"
 #include "../include/utils.h"
-
-#define LIBNAME "SCINSTALL"
 
 #define AUDIT if (1)
 
@@ -47,15 +48,15 @@ asmlinkage long sys_activate_snapshot(char __user *dev_name,
                                       char __user *passwd) {
 #endif
 
-      copied_params_t params;
+      struct snapshot_args args;
       int error;
 
-      error = copy_params_from_user(dev_name, passwd, &params);
+      error = copy_params_from_user(dev_name, passwd, &args);
       if (error) {
             return error;
       }
 
-      return activate_snapshot(params.dev_name, params.passwd);
+      return activate_snapshot(args.dev_name, args.passwd);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
@@ -70,15 +71,15 @@ __SYSCALL_DEFINEx(2, _deactivate_snapshot, char __user *, dev_name,
 asmlinkage long sys_deactivate_snapshot(char __user *dev_name,
                                         char __user *passwd) {
 #endif
-      copied_params_t params;
+      struct snapshot_args args;
       int error;
 
-      error = copy_params_from_user(dev_name, passwd, &params);
+      error = copy_params_from_user(dev_name, passwd, &args);
       if (error) {
             return error;
       }
 
-      return deactivate_snapshot(params.dev_name, params.passwd);
+      return deactivate_snapshot(args.dev_name, args.passwd);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
@@ -135,3 +136,8 @@ void uninstall_syscalls(unsigned long the_syscall_table) {
 
       log_info("sys-call table restored to its original content\n");
 }
+
+#else
+int install_syscalls(unsigned long the_syscall_table) { return 0; }
+void uninstall_syscalls(unsigned long the_syscall_table) { return; }
+#endif

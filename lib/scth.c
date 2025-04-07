@@ -22,6 +22,10 @@
  * @date October 20, 2019
  */
 
+#include <linux/module.h>
+
+#ifdef CONFIG_X86
+
 #define EXPORT_SYMTAB
 #include <asm/apic.h>
 #include <asm/cacheflush.h>
@@ -34,7 +38,6 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/mm.h>
-#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -70,118 +73,127 @@ MODULE_DESCRIPTION("system call table hacker");
 unsigned long cr0, cr4;
 
 static inline void write_cr0_forced(unsigned long val) {
-   unsigned long __force_order;
-   asm volatile("mov %0, %%cr0" : "+r"(val), "+m"(__force_order));
+      unsigned long __force_order;
+      asm volatile("mov %0, %%cr0" : "+r"(val), "+m"(__force_order));
 }
 
 static inline void _protect_memory(void) { write_cr0_forced(cr0); }
 
 static inline void _unprotect_memory(void) {
-   write_cr0_forced(cr0 & ~X86_CR0_WP);
+      write_cr0_forced(cr0 & ~X86_CR0_WP);
 }
 
 static inline void write_cr4_forced(unsigned long val) {
-   unsigned long __force_order;
-   asm volatile("mov %0, %%cr4" : "+r"(val), "+m"(__force_order));
+      unsigned long __force_order;
+      asm volatile("mov %0, %%cr4" : "+r"(val), "+m"(__force_order));
 }
 
 static inline void conditional_cet_disable(void) {
 #ifdef X86_CR4_CET
-   if (cr4 & X86_CR4_CET)
-      write_cr4_forced(cr4 & ~X86_CR4_CET);
+      if (cr4 & X86_CR4_CET)
+            write_cr4_forced(cr4 & ~X86_CR4_CET);
 #endif
 }
 
 static inline void conditional_cet_enable(void) {
 #ifdef X86_CR4_CET
-   if (cr4 & X86_CR4_CET)
-      write_cr4_forced(cr4);
+      if (cr4 & X86_CR4_CET)
+            write_cr4_forced(cr4);
 #endif
 }
 
 void unprotect_memory(void) {
-   preempt_disable();
-   cr0 = read_cr0();
-   cr4 = native_read_cr4();
-   conditional_cet_disable();
-   _unprotect_memory();
+      preempt_disable();
+      cr0 = read_cr0();
+      cr4 = native_read_cr4();
+      conditional_cet_disable();
+      _unprotect_memory();
 }
 
 void protect_memory(void) {
-   _protect_memory();
-   conditional_cet_enable();
-   preempt_enable();
+      _protect_memory();
+      conditional_cet_enable();
+      preempt_enable();
 }
 
 int get_entries(int *entry_ids, int num_acquires, unsigned long sys_call_table,
                 unsigned long *sys_ni_sys_call) {
 
-   unsigned long *p;
-   unsigned long addr;
-   int i, j, z, k; // stuff to discover memory contents
-   int ret = 0;
-   int restore[MAX_ACQUIRES] = {[0 ...(MAX_ACQUIRES - 1)] - 1};
+      unsigned long *p;
+      unsigned long addr;
+      int i, j, z, k; // stuff to discover memory contents
+      int ret = 0;
+      int restore[MAX_ACQUIRES] = {[0 ...(MAX_ACQUIRES - 1)] - 1};
 
-   printk(
-       "%s: trying to get %d entries from the sys-call table at address %px\n",
-       LIBNAME, num_acquires, (void *)sys_call_table);
-   if (num_acquires < 1) {
-      printk("%s: less than 1 sys-call table entry requested\n", LIBNAME);
-      return -1;
-   }
-   if (num_acquires > MAX_ACQUIRES) {
-      printk("%s: more than %d sys-call table entries requested\n", LIBNAME,
-             MAX_ACQUIRES);
-      return -1;
-   }
-
-   p = (unsigned long *)sys_call_table;
-
-   j = -1;
-   for (i = 0; i < 256; i++) {
-      for (z = i + 1; z < 256; z++) {
-         if (p[i] == p[z]) {
-            AUDIT {
-               printk("%s: table entries %d and %d keep the same address\n",
-                      LIBNAME, i, z);
-               printk("%s: sys_ni_syscall correctly located at %px\n", LIBNAME,
-                      (void *)p[i]);
-            }
-            addr = p[i];
-            if (j < (num_acquires - 1)) {
-               restore[++j] = i;
-               ret++;
-               printk("%s: acquiring table entry %d\n", LIBNAME, i);
-            }
-            if (j < (num_acquires - 1)) {
-               restore[++j] = z;
-               ret++;
-               printk("%s: acquiring table entry %d\n", LIBNAME, z);
-            }
-            for (k = z + 1; k < 256 && j < (num_acquires - 1); k++) {
-               if (p[i] == p[k]) {
-                  printk("%s: acquiring table entry %d\n", LIBNAME, k);
-                  restore[++j] = k;
-                  ret++;
-               }
-            }
-            if (ret == num_acquires) {
-               goto found_available_entries;
-            }
+      printk("%s: trying to get %d entries from the sys-call table at address "
+             "%px\n",
+             LIBNAME, num_acquires, (void *)sys_call_table);
+      if (num_acquires < 1) {
+            printk("%s: less than 1 sys-call table entry requested\n", LIBNAME);
             return -1;
-         }
       }
-   }
+      if (num_acquires > MAX_ACQUIRES) {
+            printk("%s: more than %d sys-call table entries requested\n",
+                   LIBNAME, MAX_ACQUIRES);
+            return -1;
+      }
 
-   printk("%s: could not locate %d available entries in the sys-call table\n",
+      p = (unsigned long *)sys_call_table;
+
+      j = -1;
+      for (i = 0; i < 256; i++) {
+            for (z = i + 1; z < 256; z++) {
+                  if (p[i] == p[z]) {
+                        AUDIT {
+                              printk("%s: table entries %d and %d keep the "
+                                     "same address\n",
+                                     LIBNAME, i, z);
+                              printk("%s: sys_ni_syscall correctly located at "
+                                     "%px\n",
+                                     LIBNAME, (void *)p[i]);
+                        }
+                        addr = p[i];
+                        if (j < (num_acquires - 1)) {
+                              restore[++j] = i;
+                              ret++;
+                              printk("%s: acquiring table entry %d\n", LIBNAME,
+                                     i);
+                        }
+                        if (j < (num_acquires - 1)) {
+                              restore[++j] = z;
+                              ret++;
+                              printk("%s: acquiring table entry %d\n", LIBNAME,
+                                     z);
+                        }
+                        for (k = z + 1; k < 256 && j < (num_acquires - 1);
+                             k++) {
+                              if (p[i] == p[k]) {
+                                    printk("%s: acquiring table entry %d\n",
+                                           LIBNAME, k);
+                                    restore[++j] = k;
+                                    ret++;
+                              }
+                        }
+                        if (ret == num_acquires) {
+                              goto found_available_entries;
+                        }
+                        return -1;
+                  }
+            }
+      }
+
+      printk(
+          "%s: could not locate %d available entries in the sys-call table\n",
           LIBNAME, num_acquires);
 
-   return -1;
+      return -1;
 
 found_available_entries:
-   printk("%s: ret is %d\n", LIBNAME, ret);
-   memcpy((char *)entry_ids, (char *)restore, ret * sizeof(int));
-   *sys_ni_sys_call = addr;
+      printk("%s: ret is %d\n", LIBNAME, ret);
+      memcpy((char *)entry_ids, (char *)restore, ret * sizeof(int));
+      *sys_ni_sys_call = addr;
 
-   return ret;
+      return ret;
 }
+
+#endif

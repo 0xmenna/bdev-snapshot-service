@@ -1,9 +1,8 @@
-#ifndef _SNAPSHOT_H_
+#ifndef SNAPSHOT_H
 
-#define _SNAPSHOT_H_
+#define SNAPSHOT_H
 
 #include <linux/atomic.h>
-#include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
@@ -42,13 +41,10 @@
 
 #define AUDIT if (1)
 
-struct loop_device {
-      int lo_number;
-};
-
 struct snapshot_devices {
-      // Registered devices that are mapped to an actual block device (i.e. a
-      // snapshot device is a registered block device to the snapshot subsystem)
+      // Registered devices that are mapped to an actual block device
+      // (i.e. a snapshot device is a registered block device to the
+      // snapshot subsystem)
       struct hlist_head sdevices[1 << HASH_BITS];
       // Locks for the registered devices buckets
       spinlock_t s_locks[1 << HASH_BITS];
@@ -64,10 +60,10 @@ static struct snapshot_devices devices;
 // A device mapped to an actual block device
 typedef struct _device {
       // Instead of working with `struct block_device` we use the dentry
-      // associated to the file identifying the block device (e.g. /dev/sda).
-      // This avoids working with the lower level structure (in most recent
-      // kernels (>= v6.8) modules must avoid working with the block_device
-      // structure).
+      // associated to the file identifying the block device (e.g.
+      // /dev/sda). This avoids working with the lower level structure (in
+      // most recent kernels (>= v6.8) modules must avoid working with the
+      // block_device structure).
       struct dentry *dentry;
 } device_t;
 
@@ -95,8 +91,8 @@ static inline void INIT_DEV(device_t *dev, struct dentry *dentry) {
 }
 
 // A device-file (it holds the dentry associated to the file managed as
-// device-file). The dentry will be related to the `lo_backing_file` of a loop
-// device.
+// device-file). The dentry will be related to the `lo_backing_file` of a
+// loop device.
 typedef struct _file_dev {
       struct dentry *dentry;
       bool is_mapped;
@@ -117,9 +113,9 @@ static void rcu_register_filedev(file_dev_t *fdev) {
       list_add_rcu(&fdev->node, &devices.fdevices);
       spin_unlock(&devices.f_lock);
 
-      log_info(
-          "Registered file-device %s as a backing file for a loop device\n",
-          fdev->dentry->d_name.name);
+      log_info("Registered file-device %s as a backing file for a loop "
+               "device\n",
+               fdev->dentry->d_name.name);
 }
 
 static void rcu_unregister_filedev(file_dev_t *fdev) {
@@ -135,8 +131,8 @@ static inline void put_fdev_callback(struct rcu_head *rcu) {
       kfree(fdev);
 }
 
-// Callback function that checks wheter a device-file is already registered.
-// Used within the `rcu_compute_on_filedev` function.
+// Callback function that checks wheter a device-file is already
+// registered. Used within the `rcu_compute_on_filedev` function.
 static inline int no_file_dev_callback(file_dev_t *fdev, void *arg) {
       if (fdev != NULL) {
             return -DEXIST;
@@ -152,8 +148,8 @@ static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
             return -NOSDEV;
       }
       if (fdev->is_mapped) {
-            // Cannot remove device file because it is mapped to a block device
-            // (i.e. has an active session)
+            // Cannot remove device file because it is mapped to a block
+            // device (i.e. has an active session)
             log_err("Cannot remove device-file %s: active session\n",
                     fdev->dentry->d_name.name);
             return -SBUSY;
@@ -163,12 +159,14 @@ static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
 
       log_info("Device-file %s unregistered\n", fdev->dentry->d_name.name);
 
-      // The free of `fdev` is demanded to the `rcu_compute_on_filedev` function
+      // The free of `fdev` is demanded to the `rcu_compute_on_filedev`
+      // function
       return FREE_RCU;
 }
 
-// Computes a function on a device-file. It looks up the device and calls the
-// compute function on the found device (it follows RCU based "locking").
+// Computes a function on a device-file. It looks up the device and calls
+// the compute function on the found device (it follows RCU based
+// "locking").
 static int rcu_compute_on_filedev(file_dev_t *lookup_fdev, void *arg,
                                   int (*compute_f)(file_dev_t *, void *)) {
 
@@ -268,13 +266,14 @@ static inline struct dentry *d_session(snapshot_session *session) {
 }
 
 /**
- * struct snap_device - Represents a block device registered to the snapshot
- * subsystem.
+ * struct snap_device - Represents a block device registered to the
+ * snapshot subsystem.
  * @device: Device number.
  * @snapshot_session Pointer to the active snapshot session.
- * @hnode: Hash list node for linking this device in the registered devices that
- * are mapped to a block device table.
- * @rcu: RCU head for safe removal of this device from the registered devices
+ * @hnode: Hash list node for linking this device in the registered
+ * devices that are mapped to a block device table.
+ * @rcu: RCU head for safe removal of this device from the registered
+ * devices
  */
 typedef struct _snap_device {
       device_t dev;
@@ -299,8 +298,8 @@ static inline void INIT_SNAP_DEVICE(snap_device *sdev, device_t device) {
       INIT_HLIST_NODE(&sdev->hnode);
 }
 
-// Free a snapshot device, but without freeing the session. It must be used in
-// RCU context
+// Free a snapshot device, but without freeing the session. It must be
+// used in RCU context
 static inline void free_sdev_no_session(snap_device *sdev) {
       put_dev(&sdev->dev);
 
@@ -344,7 +343,8 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
       free_sdev_no_session(sdev);
 }
 
-// Callback to free a snapshot device and its session within async RCU context
+// Callback to free a snapshot device and its session within async RCU
+// context
 static inline void free_sdev_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
@@ -390,7 +390,8 @@ static int remove_sdev_callback(snap_device *sdev, void *arg) {
             return -NOSDEV;
       }
       if (sdev->session) {
-            // Cannot remove snapshot device because it has an active session
+            // Cannot remove snapshot device because it has an active
+            // session
             log_err("Cannot remove snapshot device %s: active session\n",
                     sdev_name(sdev));
             return -SBUSY;
@@ -400,12 +401,14 @@ static int remove_sdev_callback(snap_device *sdev, void *arg) {
 
       log_info("Snapshot device %s unregistered\n", sdev_name(sdev));
 
-      // The free of `sdev` is demanded to the `rcu_compute_on_sdev` function
+      // The free of `sdev` is demanded to the `rcu_compute_on_sdev`
+      // function
       return FREE_SDEV;
 }
 
 // Computes a function on a snapshot device. It looks up the device by its
-// `dev_t` identifier and calls the function following RCU based "locking".
+// `dev_t` identifier and calls the function following RCU based
+// "locking".
 static inline int rcu_compute_on_sdev(dev_t dev, void *arg,
                                       int (*compute_f)(snap_device *, void *)) {
       int ret;
@@ -442,8 +445,8 @@ static inline int rcu_compute_on_sdev(dev_t dev, void *arg,
  * struct block_log_entry - Represents a logged block modification.
  * @snap_path:   Identifies the snapshot path within an active session.
  * @inode:      Pointer to the inode of the file being modified. Useful to
- * retrieve the underlying device name and to mantain a reference to avoid the
- * associated fs to be unmounted.
+ * retrieve the underlying device name and to mantain a reference to avoid
+ * the associated fs to be unmounted.
  * @block: Block (or sector) offset on the device.
  * @orig_data:    Pointer to a copy of the original block data.
  * @data_size:    Size in bytes of the block.

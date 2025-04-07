@@ -50,3 +50,7 @@ __pycache__/
 usctm/
 tests/singlefile_fs/image
 tests/singlefile_fs/singlefilemakefs
+
+# Rust related
+cli/target/
+cli/Cargo.lock

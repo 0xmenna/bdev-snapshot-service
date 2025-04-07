@@ -1,5 +1,6 @@
 {
       "files.associations": {
+            "*.md": "markdown",
             "scth.h": "c",
             "module.h": "c",
             "fs.h": "c",
@@ -17,7 +18,10 @@
             "intrusion_log.h": "c",
             "sched.h": "c",
             "mount.h": "c",
-            "singlefilefs.h": "c"
+            "singlefilefs.h": "c",
+            "ioctl.h": "c",
+            "snapshot_syscall_lib.h": "c",
+            "snapshot.h": "c"
       },
       "C_Cpp.errorSquiggles": "disabled"
 }

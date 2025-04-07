@@ -32,7 +32,8 @@ int derive_sha256(const u8 *preimage, size_t preimage_len, u8 *out) {
 }
 
 int copy_params_from_user(const char __user *dev_name,
-                          const char __user *passwd, copied_params_t *params) {
+                          const char __user *passwd,
+                          struct snapshot_args *args) {
 
       unsigned long dev_len, passw_len;
 
@@ -44,11 +45,11 @@ int copy_params_from_user(const char __user *dev_name,
             return -EFAULT;
       }
 
-      if (copy_from_user(params->dev_name, dev_name, dev_len)) {
+      if (copy_from_user(args->dev_name, dev_name, dev_len)) {
             return -EFAULT;
       }
 
-      if (copy_from_user(params->passwd, passwd, passw_len)) {
+      if (copy_from_user(args->passwd, passwd, passw_len)) {
             return -EFAULT;
       }
 

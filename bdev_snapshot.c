@@ -15,6 +15,7 @@
 #include <linux/module.h>
 
 #include "include/auth.h"
+#include "include/ioctl.h"
 #include "include/scinstall.h"
 #include "include/snapshot.h"
 #include "include/utils.h"
@@ -25,9 +26,17 @@
 
 // Module parameters
 
+#ifdef CONFIG_X86
 unsigned long the_syscall_table = 0x0;
 module_param(the_syscall_table, ulong, 0660);
 MODULE_PARM_DESC(the_syscall_table, "The syscall table address");
+#endif
+
+static bool snapshot_ioctl = false;
+module_param(snapshot_ioctl, bool, 0660);
+MODULE_PARM_DESC(
+    snapshot_ioctl,
+    "Enable or disable ioctl as an interface for the snapshot service");
 
 static u8 the_snapshot_secret[MAX_SECRET_LEN];
 module_param_string(the_snapshot_secret, the_snapshot_secret, MAX_SECRET_LEN,
@@ -38,14 +47,14 @@ MODULE_PARM_DESC(the_snapshot_secret,
                  "as its digest is stored, it will be wiped out");
 
 static int __init bdev_snapshot_init(void) {
-      int error;
+      int ret;
 
       init_devices();
 
       // Initialize the snapshot authentication subsystem
-      error = snapshot_auth_init(the_snapshot_secret);
-      if (error) {
-            return error;
+      ret = snapshot_auth_init(the_snapshot_secret);
+      if (ret) {
+            return ret;
       }
       // Wipe the plain text password
       memzero_explicit(the_snapshot_secret, MAX_SECRET_LEN);
@@ -54,17 +63,22 @@ static int __init bdev_snapshot_init(void) {
           "the plain-text password cleared out\n");
 
       // Initialize the snapshot directory
-      error = init_snapshot_path();
-      if (error) {
-            return error;
+      ret = init_snapshot_path();
+      if (ret) {
+            return ret;
       }
 
-      error = register_my_kretprobes();
-      if (error) {
-            return error;
+      ret = register_my_kretprobes();
+      if (ret) {
+            return ret;
       }
 
-      return install_syscalls(the_syscall_table);
+      if (snapshot_ioctl)
+            ret = init_snapshot_control();
+
+      ret = install_syscalls(the_syscall_table);
+
+      return ret;
 }
 
 static void __exit bdev_snapshot_exit(void) {
@@ -72,6 +86,9 @@ static void __exit bdev_snapshot_exit(void) {
       unregister_my_kretprobes();
 
       put_snapshot_path();
+
+      if (snapshot_ioctl)
+            cleanup_snapshot_control();
 
       uninstall_syscalls(the_syscall_table);
 }

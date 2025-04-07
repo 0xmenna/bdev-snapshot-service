@@ -1,5 +1,5 @@
 obj-m += the_bdev_snapshot.o
-the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o lib/snapshot.o lib/scinstall.o lib/utils.o lib/auth.o lib/snapshot.o
+the_bdev_snapshot-objs += bdev_snapshot.o lib/scth.o lib/snapshot.o lib/scinstall.o lib/utils.o lib/auth.o lib/ioctl.o lib/snapshot.o
 
 # Kernel build variables
 KDIR := /lib/modules/$(shell uname -r)/build
@@ -98,7 +98,7 @@ unload_testing_fs_driver:
 	$(call rmm_module,tests/singlefile_fs/singlefilefs.ko)
 
 mount_testing_fs:
-	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image2 /tmp/mnt2
+	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image /tmp/mnt
 
 umount_testing_fs:
 	sudo umount /tmp/mnt

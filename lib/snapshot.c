@@ -1,7 +1,3 @@
-#ifndef SNAPSHOT_SESSION_H
-
-#define SNAPSHOT_SESSION_H
-
 #include <linux/atomic.h>
 #include <linux/buffer_head.h>
 #include <linux/cdev.h>
@@ -24,7 +20,6 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
-#include <linux/syscalls.h>
 #include <linux/time.h>
 #include <linux/timer.h>
 #include <linux/types.h>
@@ -35,6 +30,7 @@
 #include "../include/auth.h"
 #include "../include/hlist_rcu.h"
 #include "../include/snapshot.h"
+#include "../include/utils.h"
 
 #define LIBNAME "SNAPSHOT"
 
@@ -48,8 +44,6 @@
       do {                                                                     \
       } while (0)
 #endif
-
-#define LO_BACKING_FILE_OFFSET 108
 
 // Global parent path for snapshot directories
 static struct path snapshot_root_path;
@@ -77,7 +71,6 @@ static int get_dev_by_name(const char *pathname, generic_dev_t *dev) {
             return error;
       }
       inode = d_backing_inode(path.dentry);
-      error = -ENOTBLK;
       if (!S_ISBLK(inode->i_mode)) {
             // The provided pathname represents the actual pathname associated
             // to the file managed as device-file (used for a loop device).
@@ -390,13 +383,15 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
             struct block_device *bdev = mnt_dentry->d_sb->s_bdev;
             if (MAJOR(bdev->bd_dev) == LOOP_MAJOR) {
                   // Extract the backing file of the loop device
-                  struct file *lo_backing_file =
-                      *(struct file **)((char *)bdev->bd_disk->private_data +
-                                        LO_BACKING_FILE_OFFSET);
+                  struct file *lo_backing_file;
+                  lo_backing_file =
+                      ((struct loop_device_meta *)bdev->bd_disk->private_data)
+                          ->lo_backing_file;
                   if (lo_backing_file) {
                         log_info("The backing file of the loop device is: %s",
                                  lo_backing_file->f_path.dentry->d_name.name);
                   }
+
             } else {
                   // A regular block device
 
@@ -451,17 +446,22 @@ struct umount_data {
 static int umount_entry_handler(struct kretprobe_instance *ri,
                                 struct pt_regs *regs) {
       struct umount_data *ud = (struct umount_data *)ri->data;
-#ifdef CONFIG_X86_64
-      struct super_block *sb = (struct super_block *)regs->di;
+      struct super_block *sb = NULL;
+
+#if defined(CONFIG_X86_64)
+      sb = (struct super_block *)regs->di;
+#elif defined(CONFIG_ARM64)
+      sb = (struct super_block *)regs->regs[0];
+#else
+#error "Architecture not supported"
+#endif
+
       if (!sb || !sb->s_bdev) {
             return -1;
       }
 
       ud->dev = sb->s_bdev->bd_dev;
       return 0;
-#else
-#error "Unsupported architecture"
-#endif
 }
 
 static int umount_ret_handler(struct kretprobe_instance *ri,
@@ -723,5 +723,3 @@ int deactivate_snapshot(const char *dev_name, const char *passwd) {
 
       return 0;
 }
-
-#endif

@@ -1,6 +1,6 @@
-#ifndef _SC_INSTALL_H_
+#ifndef SC_INSTALL_H
 
-#define _SC_INSTALL_H_
+#define SC_INSTALL_H
 
 int install_syscalls(unsigned long);
 void uninstall_syscalls(unsigned long);
