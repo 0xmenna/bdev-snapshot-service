@@ -38,7 +38,6 @@ tags
 TAGS
 
 # Ignore editor-specific files
-.vscode/
 .idea/
 *.iml
 *.user

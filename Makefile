@@ -89,7 +89,6 @@ create_testing_fs:
 
 rm_testing_fs:
 	rm -rf /tmp/mnt
-	sudo losetup -d /dev/loop0
 	rm tests/singlefile_fs/image
 
 load_testing_fs_driver:
@@ -99,7 +98,7 @@ unload_testing_fs_driver:
 	$(call rmm_module,tests/singlefile_fs/singlefilefs.ko)
 
 mount_testing_fs:
-	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image /tmp/mnt
+	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image2 /tmp/mnt2
 
 umount_testing_fs:
 	sudo umount /tmp/mnt

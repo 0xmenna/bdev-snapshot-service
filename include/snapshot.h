@@ -42,6 +42,10 @@
 
 #define AUDIT if (1)
 
+struct loop_device {
+      int lo_number;
+};
+
 struct snapshot_devices {
       // Registered devices that are mapped to an actual block device (i.e. a
       // snapshot device is a registered block device to the snapshot subsystem)
@@ -112,6 +116,10 @@ static void rcu_register_filedev(file_dev_t *fdev) {
       spin_lock(&devices.f_lock);
       list_add_rcu(&fdev->node, &devices.fdevices);
       spin_unlock(&devices.f_lock);
+
+      log_info(
+          "Registered file-device %s as a backing file for a loop device\n",
+          fdev->dentry->d_name.name);
 }
 
 static void rcu_unregister_filedev(file_dev_t *fdev) {
@@ -124,6 +132,7 @@ static inline void put_fdev_callback(struct rcu_head *rcu) {
       file_dev_t *fdev = container_of(rcu, file_dev_t, rcu);
 
       put_fdev(fdev);
+      kfree(fdev);
 }
 
 // Callback function that checks wheter a device-file is already registered.
@@ -151,6 +160,8 @@ static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
       }
       // Unregister the device
       rcu_unregister_filedev(fdev);
+
+      log_info("Device-file %s unregistered\n", fdev->dentry->d_name.name);
 
       // The free of `fdev` is demanded to the `rcu_compute_on_filedev` function
       return FREE_RCU;
@@ -182,11 +193,12 @@ static int rcu_compute_on_filedev(file_dev_t *lookup_fdev, void *arg,
       if (ret == FREE_RCU) {
 #ifdef ASYNC
             // Suited for atomic context
-            call_rcu(&fdev->rcu, put_fdev_callback);
+            call_rcu(&found_fdev->rcu, put_fdev_callback);
 #else
             // Never activate this when executing in atomic context
             sychronize_rcu();
-            put_fdev(fdev);
+            put_fdev(found_fdev);
+            kfree(found_fdev);
 #endif
             ret = 0;
       }
@@ -386,6 +398,8 @@ static int remove_sdev_callback(snap_device *sdev, void *arg) {
       // Unregister the snapshot device
       rcu_unregister_snapdevice(sdev);
 
+      log_info("Snapshot device %s unregistered\n", sdev_name(sdev));
+
       // The free of `sdev` is demanded to the `rcu_compute_on_sdev` function
       return FREE_SDEV;
 }
@@ -477,5 +491,7 @@ void put_snapshot_path(void);
 
 int activate_snapshot(const char *dev_name, const char *passwd);
 int deactivate_snapshot(const char *dev_name, const char *passwd);
+
+void init_devices(void);
 
 #endif

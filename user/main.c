@@ -9,7 +9,8 @@
 #define DISACTIVATE 174
 
 static const char *password = "Th3_Snapsh0t_s3cr3t";
-static const char *dev_name = "/dev/loop0";
+static const char *dev_name =
+    "/home/ubuntu/bdev-snapshot-service/tests/singlefile_fs/image2";
 
 static int activate_snapshot() { return syscall(ACTIVATE, dev_name, password); }
 

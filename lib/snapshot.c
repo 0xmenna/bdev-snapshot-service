@@ -49,13 +49,15 @@
       } while (0)
 #endif
 
-#define LO_BACKING_FILE_OFFSET 224
+#define LO_BACKING_FILE_OFFSET 108
 
 // Global parent path for snapshot directories
 static struct path snapshot_root_path;
 
 // Per-CPU block log FIFO
 static DEFINE_PER_CPU(block_fifo, cpu_block_fifo);
+
+void init_devices(void) { INIT_LIST_HEAD(&devices.fdevices); }
 
 static inline bool may_open_device(const struct path *path) {
       return !(path->mnt->mnt_flags & MNT_NODEV) &&
@@ -147,7 +149,7 @@ static int session_path_callback(snap_device *sdev, void *arg) {
       }
 
       // Create the new directory
-      ret = vfs_mkdir(snapshot_root_path.mnt->mnt_userns,
+      ret = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
                       d_inode(snapshot_root_path.dentry), subdentry, 0500);
       if (ret) {
             if (ret == -EEXIST) {
@@ -306,7 +308,7 @@ int init_snapshot_path(void) {
             goto cleanup_root;
       }
 
-      error = vfs_mkdir(root_path.mnt->mnt_userns, d_inode(root_path.dentry),
+      error = vfs_mkdir(root_path.mnt->mnt_idmap, d_inode(root_path.dentry),
                         dentry, 0500);
       if (error)
             goto cleanup_all;
@@ -391,8 +393,10 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                   struct file *lo_backing_file =
                       *(struct file **)((char *)bdev->bd_disk->private_data +
                                         LO_BACKING_FILE_OFFSET);
-                  log_info("The backing file of the loop device is: %s",
-                           lo_backing_file->f_path.dentry->d_name.name);
+                  if (lo_backing_file) {
+                        log_info("The backing file of the loop device is: %s",
+                                 lo_backing_file->f_path.dentry->d_name.name);
+                  }
             } else {
                   // A regular block device
 
@@ -401,6 +405,7 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                                       new_session_on_mount_callback);
             }
       }
+
       dput(mnt_dentry);
 
 ret_handler:

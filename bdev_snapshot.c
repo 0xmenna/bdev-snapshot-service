@@ -40,6 +40,8 @@ MODULE_PARM_DESC(the_snapshot_secret,
 static int __init bdev_snapshot_init(void) {
       int error;
 
+      init_devices();
+
       // Initialize the snapshot authentication subsystem
       error = snapshot_auth_init(the_snapshot_secret);
       if (error) {
