@@ -27,13 +27,14 @@
 // Module parameters
 
 #ifdef CONFIG_X86
+// If no syscall support is needed just leave the syscall table address to 0x0
 unsigned long the_syscall_table = 0x0;
-module_param(the_syscall_table, ulong, 0660);
+module_param(the_syscall_table, ulong, 0440);
 MODULE_PARM_DESC(the_syscall_table, "The syscall table address");
 #endif
 
 static bool snapshot_ioctl = false;
-module_param(snapshot_ioctl, bool, 0660);
+module_param(snapshot_ioctl, bool, 0440);
 MODULE_PARM_DESC(
     snapshot_ioctl,
     "Enable or disable ioctl as an interface for the snapshot service");
@@ -76,7 +77,9 @@ static int __init bdev_snapshot_init(void) {
       if (snapshot_ioctl)
             ret = init_snapshot_control();
 
-      ret = install_syscalls(the_syscall_table);
+      if (the_syscall_table != 0x0) {
+            ret = install_syscalls(the_syscall_table);
+      }
 
       return ret;
 }
@@ -90,7 +93,9 @@ static void __exit bdev_snapshot_exit(void) {
       if (snapshot_ioctl)
             cleanup_snapshot_control();
 
-      uninstall_syscalls(the_syscall_table);
+      if (the_syscall_table != 0x0) {
+            uninstall_syscalls(the_syscall_table);
+      }
 }
 
 module_init(bdev_snapshot_init);

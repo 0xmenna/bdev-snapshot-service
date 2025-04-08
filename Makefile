@@ -20,11 +20,33 @@ define clean_module
 	make -C $(KDIR) M=$(PWD)/$1 clean
 endef
 
+define ins_snap_module_syscall
+	sudo insmod the_bdev_snapshot.ko \
+	the_syscall_table=$$(sudo cat /sys/module/the_usctm/parameters/sys_call_table_address) \ the_snapshot_secret=$$(sudo cat $(PASSWD_PATH))
+endef
+
+define ins_snap_module_ioctl
+	sudo insmod the_bdev_snapshot.ko \
+		snapshot_ioctl=1 \
+		the_snapshot_secret=$$(sudo cat $(PASSWD_PATH))
+endef
+
+define ins_snap_module_all
+	sudo insmod the_bdev_snapshot.ko \
+		the_syscall_table=$$(sudo cat /sys/module/the_usctm/parameters/sys_call_table_address) \
+		snapshot_ioctl=1 \
+		the_snapshot_secret=$$(sudo cat $(PASSWD_PATH))
+endef
+
 define ins_module
 	@if [ "$1" = "usctm" ]; then \
 		sudo insmod usctm/the_usctm.ko; \
-	elif [ "$1" = "bdev_snapshot" ]; then \
-		sudo insmod the_bdev_snapshot.ko the_syscall_table=$$(sudo cat /sys/module/the_usctm/parameters/sys_call_table_address) the_snapshot_secret=$$(sudo cat $(PASSWD_PATH)); \
+	elif [ "$1" = "bdev_snapshot_syscall" ]; then \
+		$(ins_snap_module_syscall); \
+	elif [ "$1" = "bdev_snapshot_ioctl" ]; then \
+		$(ins_snap_module_ioctl); \
+	elif [ "$1" = "bdev_snapshot_all" ]; then \
+		$(ins_snap_module_all); \
 	else \
 		sudo insmod tests/singlefile_fs/singlefilefs.ko; \
 	fi
@@ -36,10 +58,6 @@ endef
 
 # -----------------------------------------------------------
 
-up: all load
-
-down: unload clean
-
 all: build_usctm build_bdev_snapshot build_testing_fs
 
 clean:
@@ -49,9 +67,13 @@ clean:
 	rm -rf usctm
 	rm tests/singlefile_fs/singlefilemakefs
 
-load: load_usctm load_bdev_snapshot load_testing_fs_driver
+load_X86: load_usctm load_bdev_snapshot_all load_testing_fs_driver
 
-unload: unload_testing_fs_driver unload_bdev_snapshot unload_usctm
+unload_X86: unload_testing_fs_driver unload_bdev_snapshot unload_usctm
+
+load: load_bdev_snapshot_ioctl load_testing_fs_driver
+
+unload: unload_testing_fs_driver unload_bdev_snapshot
 
 clone_usctm:
 	@if [ ! -d "usctm" ]; then \
@@ -73,8 +95,14 @@ build_testing_fs:
 load_usctm:
 	$(call ins_module,usctm)
 
-load_bdev_snapshot:
-	$(call ins_module,bdev_snapshot)
+load_bdev_snapshot_ioctl:
+	$(call ins_module,bdev_snapshot_ioctl)
+
+load_bdev_snapshot_syscall:
+	$(call ins_module,bdev_snapshot_syscall)
+
+load_bdev_snapshot_all:
+	$(call ins_module,bdev_snapshot_all)
 
 unload_usctm:
 	$(call rmm_module,usctm/the_usctm.ko)

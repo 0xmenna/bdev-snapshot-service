@@ -1,8 +1,8 @@
 #ifndef SNAPSHOT_IOCTL_H
 #define SNAPSHOT_IOCTL_H
 
-#define DEVICE_NAME "snapshot"
-#define CLASS_NAME "snapdev"
+#define DEVICE_NAME "snap"
+#define CLASS_NAME "snpc"
 
 #define SNAPSHOT_IOCTL_MAGIC 'S'
 #define SNAP_ACTIVATE _IOW(SNAPSHOT_IOCTL_MAGIC, 1, struct snapshot_args)

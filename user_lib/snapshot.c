@@ -4,6 +4,8 @@
 
 #include "snapshot.h"
 
+#define USE_IOCTL
+
 #ifdef USE_IOCTL
 
 #include <fcntl.h>
@@ -22,12 +24,11 @@ struct snapshot_args {
       char passwd[64];
 };
 
-#define DEVICE_FILE "/dev/snapshot"
+#define DEVICE_FILE "/dev/snap"
 
 int sys_activate_snapshot(const char *devname, const char *password) {
       int fd = open(DEVICE_FILE, O_RDWR);
       if (fd < 0) {
-            perror("open");
             return -errno;
       }
 
@@ -38,7 +39,6 @@ int sys_activate_snapshot(const char *devname, const char *password) {
 
       int ret = ioctl(fd, SNAP_ACTIVATE, &args);
       if (ret < 0) {
-            perror("ioctl SNAP_ACTIVATE failed");
             close(fd);
             return -errno;
       }
@@ -50,7 +50,6 @@ int sys_activate_snapshot(const char *devname, const char *password) {
 int sys_deactivate_snapshot(const char *devname, const char *password) {
       int fd = open(DEVICE_FILE, O_RDWR);
       if (fd < 0) {
-            perror("open");
             return -errno;
       }
 
@@ -61,7 +60,6 @@ int sys_deactivate_snapshot(const char *devname, const char *password) {
 
       int ret = ioctl(fd, SNAP_DEACTIVATE, &args);
       if (ret < 0) {
-            perror("ioctl SNAP_DEACTIVATE failed");
             close(fd);
             return -errno;
       }
