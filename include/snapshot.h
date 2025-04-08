@@ -12,6 +12,7 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/namei.h>
+#include <linux/rculist.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -38,6 +39,7 @@
 #define FREE_SDEV_NO_SESSION 14
 #define SNAPDIR_EXIST 15
 #define FREE_RCU 16
+#define NOFDEV 17
 
 #define AUDIT if (1)
 
@@ -57,39 +59,6 @@ struct snapshot_devices {
 // Registered devices to the snapshot subsystem
 static struct snapshot_devices devices;
 
-// A device mapped to an actual block device
-typedef struct _device {
-      // Instead of working with `struct block_device` we use the dentry
-      // associated to the file identifying the block device (e.g.
-      // /dev/sda). This avoids working with the lower level structure (in
-      // most recent kernels (>= v6.8) modules must avoid working with the
-      // block_device structure).
-      struct dentry *dentry;
-} device_t;
-
-static inline const char *devname(device_t *dev) {
-      return dev->dentry->d_name.name;
-}
-
-static inline struct dentry *d_dev(device_t *dev) { return dev->dentry; }
-
-static inline struct inode *i_dev(device_t *dev) {
-      return dev->dentry->d_inode;
-}
-
-static inline dev_t num_dev(device_t *dev) {
-      struct inode *inode = i_dev(dev);
-      return inode->i_rdev;
-}
-
-static inline void put_dev(device_t *dev) { dput(dev->dentry); }
-
-static inline void dev_get(device_t *dev) { dget(dev->dentry); }
-
-static inline void INIT_DEV(device_t *dev, struct dentry *dentry) {
-      dev->dentry = dget(dentry);
-}
-
 // A device-file (it holds the dentry associated to the file managed as
 // device-file). The dentry will be related to the `lo_backing_file` of a
 // loop device.
@@ -108,6 +77,11 @@ static inline void INIT_FDEV(file_dev_t *fdev, struct dentry *dentry) {
 
 static inline void put_fdev(file_dev_t *fdev) { dput(fdev->dentry); }
 
+static inline file_dev_t *get_fdev(file_dev_t *fdev) {
+      dget(fdev->dentry);
+      return fdev;
+}
+
 static void rcu_register_filedev(file_dev_t *fdev) {
       spin_lock(&devices.f_lock);
       list_add_rcu(&fdev->node, &devices.fdevices);
@@ -124,6 +98,12 @@ static void rcu_unregister_filedev(file_dev_t *fdev) {
       spin_unlock(&devices.f_lock);
 }
 
+static void rcu_replace_filedev(file_dev_t *old_fdev, file_dev_t *new_fdev) {
+      spin_lock(&devices.f_lock);
+      list_replace_rcu(&old_fdev->node, &new_fdev->node);
+      spin_unlock(&devices.f_lock);
+}
+
 static inline void put_fdev_callback(struct rcu_head *rcu) {
       file_dev_t *fdev = container_of(rcu, file_dev_t, rcu);
 
@@ -137,6 +117,14 @@ static inline int no_file_dev_callback(file_dev_t *fdev, void *arg) {
       if (fdev != NULL) {
             return -DEXIST;
       }
+      return 0;
+}
+
+static inline int lo_backing_file_exists(file_dev_t *fdev, void *arg) {
+      if (fdev == NULL) {
+            return -NOFDEV;
+      }
+
       return 0;
 }
 
@@ -164,17 +152,17 @@ static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
       return FREE_RCU;
 }
 
-// Computes a function on a device-file. It looks up the device and calls
-// the compute function on the found device (it follows RCU based
+// Computes a function on a device-file. It looks up the device (via its dentry)
+// and calls the compute function on the found device (it follows RCU based
 // "locking").
-static int rcu_compute_on_filedev(file_dev_t *lookup_fdev, void *arg,
+static int rcu_compute_on_filedev(struct dentry *lookup_dentry, void *arg,
                                   int (*compute_f)(file_dev_t *, void *)) {
 
       file_dev_t *fdev, *found_fdev = NULL;
       struct inode *fdev_inode = NULL;
       int ret;
 
-      struct inode *lookup_inode = d_inode(lookup_fdev->dentry);
+      struct inode *lookup_inode = d_inode(lookup_dentry);
 
       rcu_read_lock();
       list_for_each_entry(fdev, &devices.fdevices, node) {
@@ -207,7 +195,7 @@ static int rcu_compute_on_filedev(file_dev_t *lookup_fdev, void *arg,
 typedef struct generic_dev {
       enum { BDEV, FDEV } type;
       union {
-            device_t dev;
+            dev_t dev;
             file_dev_t fdev;
       };
 } generic_dev_t;
@@ -234,14 +222,12 @@ typedef struct _snapshot_session {
       spinlock_t locks[1 << COMMITTED_HASH_BITS];
 } snapshot_session;
 
-static inline int init_snapshot_session(snapshot_session *snap_session,
-                                        time64_t timestamp) {
+static inline void init_snapshot_session(snapshot_session *snap_session,
+                                         time64_t timestamp) {
 
       snap_session->snap_path.dentry = NULL;
       snap_session->snap_path.mnt = NULL;
       snap_session->mount_timestamp = timestamp;
-
-      return 0;
 }
 
 static inline struct path session_path_get(snapshot_session *session) {
@@ -268,42 +254,36 @@ static inline struct dentry *d_session(snapshot_session *session) {
 /**
  * struct snap_device - Represents a block device registered to the
  * snapshot subsystem.
- * @device: Device number.
- * @snapshot_session Pointer to the active snapshot session.
+ * @dev: Device number.
+ * @dentry: Dentry that identifies the device. For loop devices it is the dentry
+ * of the `lo_backing_file`
+ * @snapshot_session: Pointer to the active snapshot session.
  * @hnode: Hash list node for linking this device in the registered
  * devices that are mapped to a block device table.
  * @rcu: RCU head for safe removal of this device from the registered
  * devices
+ * @private_data: Useful for holding private data (e.g. for loop devices it can
+ * hold the dentry associated to the `lo_backing_file`)
  */
 typedef struct _snap_device {
-      device_t dev;
+      dev_t dev;
       snapshot_session *session;
       struct hlist_node hnode;
       struct rcu_head rcu;
+      void *private_data;
 } snap_device;
 
-static inline device_t dev(snap_device *sdev) { return sdev->dev; }
+extern inline dev_t d_num(snap_device *sdev) { return sdev->dev; }
 
-extern inline dev_t d_num(snap_device *sdev) { return num_dev(&sdev->dev); }
-
-static inline const char *sdev_name(snap_device *sdev) {
-      return devname(&sdev->dev);
+static inline u32 hash_dev(snap_device *sdev) {
+      return hash_32(sdev->dev, HASH_BITS);
 }
 
-static inline u32 hash_dev(dev_t dev) { return hash_32(dev, HASH_BITS); }
-
-static inline void INIT_SNAP_DEVICE(snap_device *sdev, device_t device) {
-      sdev->dev = device;
+static inline void INIT_SNAP_DEVICE(snap_device *sdev, dev_t dev) {
+      sdev->dev = dev;
       sdev->session = NULL;
+      sdev->private_data = NULL;
       INIT_HLIST_NODE(&sdev->hnode);
-}
-
-// Free a snapshot device, but without freeing the session. It must be
-// used in RCU context
-static inline void free_sdev_no_session(snap_device *sdev) {
-      put_dev(&sdev->dev);
-
-      kfree(sdev);
 }
 
 // Free a snapshot device and its session
@@ -328,7 +308,7 @@ static void free_sdev(snap_device *sdev) {
             kfree(session);
       }
 
-      free_sdev_no_session(sdev);
+      kfree(sdev);
 }
 
 // Callback to free a snapshot device without its session within async RCU
@@ -337,10 +317,10 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
       AUDIT log_info(
-          "Callback free (no session): device : %s, preempt_count : %d\n",
-          sdev_name(sdev), preempt_count());
+          "Callback free (no session): device : %d, preempt_count : %d\n",
+          d_num(sdev), preempt_count());
 
-      free_sdev_no_session(sdev);
+      kfree(sdev);
 }
 
 // Callback to free a snapshot device and its session within async RCU
@@ -348,8 +328,8 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
 static inline void free_sdev_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
-      AUDIT log_info("Callback free: device : %s, preempt_count : %d\n",
-                     sdev_name(sdev), preempt_count());
+      AUDIT log_info("Callback free: device : %d, preempt_count : %d\n",
+                     d_num(sdev), preempt_count());
 
       free_sdev(sdev);
 }
@@ -360,7 +340,7 @@ static inline void rcu_register_snapdevice(snap_device *sdev) {
 
       HLIST_RCU_INSERT(sdev, devices.sdevices, devices.s_locks, hash);
 
-      log_info("New Device %s registered\n", sdev_name(sdev));
+      log_info("New Device %d registered\n", d_num(sdev));
 }
 
 // Remove a snapshot device from the registered devices
@@ -369,7 +349,7 @@ static inline void rcu_unregister_snapdevice(snap_device *sdev) {
 
       HLIST_RCU_REMOVE(sdev, devices.s_locks, hash);
 
-      log_info("Device %s unregistered\n", sdev_name(sdev));
+      log_info("Device %d unregistered\n", d_num(sdev));
 }
 
 // Helper function to check if a snapshot device is not registered. It
@@ -386,20 +366,20 @@ static inline int no_sdev_callback(snap_device *sdev, void *arg) {
 // used as a callback for the `rcu_compute_on_sdev` function.
 static int remove_sdev_callback(snap_device *sdev, void *arg) {
       if (!sdev) {
-            log_err("No snapshot device found for %s\n", sdev_name(sdev));
+            log_err("No snapshot device found for device %d\n", d_num(sdev));
             return -NOSDEV;
       }
       if (sdev->session) {
             // Cannot remove snapshot device because it has an active
             // session
-            log_err("Cannot remove snapshot device %s: active session\n",
-                    sdev_name(sdev));
+            log_err("Cannot remove snapshot device %d: active session\n",
+                    d_num(sdev));
             return -SBUSY;
       }
       // Unregister the snapshot device
       rcu_unregister_snapdevice(sdev);
 
-      log_info("Snapshot device %s unregistered\n", sdev_name(sdev));
+      log_info("Snapshot device %d unregistered\n", d_num(sdev));
 
       // The free of `sdev` is demanded to the `rcu_compute_on_sdev`
       // function
@@ -433,7 +413,7 @@ static inline int rcu_compute_on_sdev(dev_t dev, void *arg,
             call_rcu(&sdev->rcu, free_sdev_no_session_callback);
 #else
             sychronize_rcu();
-            free_sdev_no_session(sdev);
+            kfree(sdev);
 #endif
             ret = 0;
       }

@@ -87,10 +87,8 @@ static int get_dev_by_name(const char *pathname, generic_dev_t *dev) {
             goto out_path_put;
 
       // An actual block device
-      device_t bdev;
-      INIT_DEV(&dev->dev, path.dentry);
       dev->type = BDEV;
-      dev->dev = bdev;
+      dev->dev = inode->i_rdev;
 
       error = 0;
 out_path_put:
@@ -176,8 +174,6 @@ static int session_path_callback(snap_device *sdev, void *arg) {
       HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
                         hash_dev(d_num(new_sdev)));
 
-      dev_get(&new_sdev->dev);
-
       // This is to avoid freeing the session in the callback (since it is used
       // by the newer snap device)
       ret = FREE_SDEV_NO_SESSION;
@@ -205,15 +201,13 @@ static int register_device(const char *dev_name) {
             error =
                 rcu_compute_on_sdev(d_num(&tmp_sdev), NULL, no_sdev_callback);
             if (error) {
-                  put_dev(&tmp_sdev.dev);
-                  AUDIT log_err("Device %s is already registered\n",
-                                sdev_name(&tmp_sdev));
+                  AUDIT log_err("Device %d is already registered\n",
+                                d_num(&tmp_sdev));
 
                   return error;
             }
             sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
             if (!sdev) {
-                  put_dev(&tmp_sdev.dev);
                   return -ENOMEM;
             }
             memcpy(sdev, &tmp_sdev, sizeof(snap_device));
@@ -223,8 +217,8 @@ static int register_device(const char *dev_name) {
             break;
       case FDEV:
             // Check if the device file is already registered
-            error =
-                rcu_compute_on_filedev(&dev.fdev, NULL, no_file_dev_callback);
+            error = rcu_compute_on_filedev(dev.fdev.dentry, NULL,
+                                           no_file_dev_callback);
             if (error) {
                   put_fdev(&dev.fdev);
                   AUDIT log_err("Device file %s is already registered\n",
@@ -256,17 +250,15 @@ static int unregister_device(const char *dev_name) {
 
       switch (dev.type) {
       case BDEV:
-            error = rcu_compute_on_sdev(num_dev(&dev.dev), NULL,
-                                        remove_sdev_callback);
-            put_dev(&dev.dev);
+            error = rcu_compute_on_sdev(dev.dev, NULL, remove_sdev_callback);
             if (error) {
                   return error;
             }
             break;
 
       case FDEV:
-            error =
-                rcu_compute_on_filedev(&dev.fdev, NULL, remove_fdev_callback);
+            error = rcu_compute_on_filedev(dev.fdev.dentry, NULL,
+                                           remove_fdev_callback);
             put_fdev(&dev.fdev);
             if (error) {
                   return error;
@@ -345,11 +337,7 @@ static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
       }
 
       mount_timestamp = ktime_get_real_seconds();
-      error = init_snapshot_session(session, mount_timestamp);
-      if (error) {
-            kfree(session);
-            return error;
-      }
+      init_snapshot_session(session, mount_timestamp);
 
       old_sdev = sdev;
       new_sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
@@ -363,9 +351,36 @@ static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
       HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
                         hash_dev(d_num(new_sdev)));
 
-      dev_get(&new_sdev->dev);
-
       return FREE_SDEV;
+}
+
+static inline int map_filedev_callback(file_dev_t *fdev, void *arg) {
+      file_dev_t *old_fdev, *new_fdev;
+      bool map;
+      if (fdev == NULL) {
+            return -NOFDEV;
+      }
+
+      old_fdev = fdev;
+
+      if (old_fdev->is_mapped == map) {
+            return 0;
+      }
+
+      map = *((bool *)arg);
+
+      new_fdev = kmalloc(sizeof(file_dev_t), GFP_ATOMIC);
+      if (!new_fdev) {
+            return -ENOMEM;
+      }
+      memcpy(new_fdev, old_fdev, sizeof(file_dev_t));
+      new_fdev->is_mapped = map;
+
+      rcu_replace_filedev(old_fdev, new_fdev);
+
+      get_fdev(new_fdev);
+
+      return FREE_RCU;
 }
 
 static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
@@ -373,7 +388,7 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
       struct dentry *mnt_dentry;
       dev_t dev;
       snap_device *sdev;
-      int error;
+      int ret;
 
       mnt_dentry = dget((struct dentry *)regs_return_value(regs));
       if (IS_ERR(mnt_dentry))
@@ -382,20 +397,76 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
       if (mnt_dentry->d_sb->s_bdev) {
             struct block_device *bdev = mnt_dentry->d_sb->s_bdev;
             if (MAJOR(bdev->bd_dev) == LOOP_MAJOR) {
+                  // Loop device
+
                   // Extract the backing file of the loop device
                   struct file *lo_backing_file;
                   lo_backing_file =
                       ((struct loop_device_meta *)bdev->bd_disk->private_data)
                           ->lo_backing_file;
-                  if (lo_backing_file) {
-                        log_info("The backing file of the loop device is: %s",
-                                 lo_backing_file->f_path.dentry->d_name.name);
+
+                  // Check if the backing file is registered within the
+                  // `fdevices` list
+                  ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
+                                               NULL, lo_backing_file_exists);
+                  if (ret) {
+                        // The device-file is not registered
+                        goto ret_handler;
+                  }
+
+                  // The device-file is registered. We can create a new snapshot
+                  // device and activate a new session
+                  snap_device tmp_sdev, *sdev;
+                  INIT_SNAP_DEVICE(&tmp_sdev, bdev->bd_dev);
+
+                  ret = rcu_compute_on_sdev(d_num(&tmp_sdev), NULL,
+                                            no_sdev_callback);
+                  if (unlikely(ret)) {
+                        AUDIT log_err("Loop device %d was already registered\n",
+                                      d_num(&tmp_sdev));
+
+                        goto ret_handler;
+                  }
+                  sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
+                  if (!sdev) {
+                        goto ret_handler;
+                  }
+                  memcpy(sdev, &tmp_sdev, sizeof(snap_device));
+
+                  // Create the session
+                  snapshot_session *session;
+                  time64_t mount_timestamp;
+
+                  session = kmalloc(sizeof(snapshot_session), GFP_ATOMIC);
+                  if (!session) {
+                        kfree(sdev);
+                        goto ret_handler;
+                  }
+
+                  mount_timestamp = ktime_get_real_seconds();
+                  init_snapshot_session(session, mount_timestamp);
+                  sdev->session = session;
+                  sdev->private_data = (void *)lo_backing_file->f_path.dentry;
+
+                  // Register the snapshot device
+                  rcu_register_snapdevice(sdev);
+
+                  // Map the device-file
+                  bool use_mapping = true;
+                  ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
+                                               &use_mapping,
+                                               map_filedev_callback);
+                  if (ret) {
+                        kfree(session);
+                        kfree(sdev);
+                        goto ret_handler;
                   }
 
             } else {
                   // A regular block device
 
-                  // Don't really care about the error
+                  // Don't really care about the error. If the device is not
+                  // registered it simply wont perform any action.
                   rcu_compute_on_sdev(bdev->bd_dev, NULL,
                                       new_session_on_mount_callback);
             }
@@ -416,25 +487,41 @@ static struct kretprobe rp_mount = {
 // callback for the `rcu_compute_on_sdev` function.
 static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
       snap_device *old_sdev, *new_sdev;
+      int ret;
 
       if (!sdev)
             return -NOSDEV;
 
-      old_sdev = sdev;
-      new_sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
-      if (!new_sdev)
-            return -ENOMEM;
+      if (MAJOR(d_num(sdev)) == LOOP_MAJOR) {
+            // Loop device
 
-      memcpy(new_sdev, old_sdev, sizeof(snap_device));
+            // Unmap the device-file
+            bool use_mapping = false;
+            ret = rcu_compute_on_filedev((struct dentry *)sdev->private_data,
+                                         &use_mapping, map_filedev_callback);
+            if (ret) {
+                  return ret;
+            }
 
-      // Set the session pointer to NULL to mark the unmount
-      new_sdev->session = NULL;
+            // Unregister the snapshot device
+            rcu_unregister_snapdevice(sdev);
+      } else {
+            // Regular block device
 
-      // Replace the old snapshot device entry with the updated one
-      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
-                        hash_dev(d_num(new_sdev)));
+            old_sdev = sdev;
+            new_sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
+            if (!new_sdev)
+                  return -ENOMEM;
 
-      dev_get(&new_sdev->dev);
+            memcpy(new_sdev, old_sdev, sizeof(snap_device));
+
+            // Set the session pointer to NULL to mark the unmount
+            new_sdev->session = NULL;
+
+            // Replace the old snapshot device entry with the updated one
+            HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
+                              hash_dev(d_num(new_sdev)));
+      }
 
       return FREE_SDEV;
 }
