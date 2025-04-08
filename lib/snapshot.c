@@ -543,13 +543,15 @@ static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
       return FREE_SDEV;
 }
 
-struct umount_data {
+struct umount_kretprobe_metadata {
       dev_t dev;
 };
 
 static int umount_entry_handler(struct kretprobe_instance *ri,
                                 struct pt_regs *regs) {
-      struct umount_data *ud = (struct umount_data *)ri->data;
+
+      struct umount_kretprobe_metadata *meta =
+          (struct umount_kretprobe_metadata *)ri->data;
       struct super_block *sb = NULL;
 
 #if defined(CONFIG_X86_64)
@@ -564,17 +566,17 @@ static int umount_entry_handler(struct kretprobe_instance *ri,
             return -1;
       }
 
-      ud->dev = sb->s_bdev->bd_dev;
+      meta->dev = sb->s_bdev->bd_dev;
       return 0;
 }
 
 static int umount_ret_handler(struct kretprobe_instance *ri,
                               struct pt_regs *regs) {
-      struct umount_data *ud = (struct umount_data *)ri->data;
-      dev_t dev = ud->dev;
+      struct umount_kretprobe_metadata *meta =
+          (struct umount_kretprobe_metadata *)ri->data;
 
       // Don't care about the error
-      rcu_compute_on_sdev(dev, NULL, free_session_on_umount_callback);
+      rcu_compute_on_sdev(meta->dev, NULL, free_session_on_umount_callback);
 
       return 0;
 }
@@ -583,12 +585,28 @@ static struct kretprobe rp_umount = {
     .kp.symbol_name = "kill_block_super",
     .entry_handler = umount_entry_handler,
     .handler = umount_ret_handler,
-    .data_size = sizeof(struct umount_data),
+    .data_size = sizeof(struct umount_kretprobe_metadata),
 };
 
-// Callback function used to retrieve the session path for a snapshot
-// device. This is a helper function used within `rcu_compute_on_sdev`
-static int sdev_session_path(snap_device *sdev, void *out) {
+struct write_metadata {
+      struct inode *inode;
+      loff_t offset;
+      size_t count;
+
+      sector_t out_block;
+};
+
+// Callback function used to acquire the block number that will eventually be
+// overwritten. It adds the block number to the session
+// `reading_blocks` in order for the `sb_read` kretprobe to now which block to
+// copy. It adds the block also to the session `committed_blocks` to know which
+// subsequent write will not be captured because the block was already copied.
+// NOTE: As of now we support a single block write at a time.
+static int record_block_on_write_callback(snap_device *sdev, void *arg) {
+      snapshot_session *session;
+      struct snap_block *snap_block;
+      struct write_metadata *wm;
+      sector_t block;
 
       if (!sdev) {
             return -NOSDEV;
@@ -596,166 +614,174 @@ static int sdev_session_path(snap_device *sdev, void *out) {
       if (!sdev->session) {
             return -SDEVNOTACTIVE;
       }
-      struct path *path = (struct path *)out;
-      struct path snap_path = session_path_get(sdev->session);
 
-      *path = snap_path;
+      session = sdev->session;
+      wm = (struct write_metadata *)arg;
+
+      block = get_block(wm->inode, wm->offset);
+      wm->out_block = block;
+
+      snap_block = kmalloc(sizeof(struct snap_block), GFP_ATOMIC);
+      if (!snap_block) {
+            return -ENOMEM;
+      }
+
+      INIT_SNAP_BLOCK(snap_block, block);
+      u32 b_hash = hash_block(snap_block->block);
+
+      // Add the block to the committed blocks (if it does not exist already)
+      spin_lock(&session->cb_locks[b_hash]);
+
+      struct snap_block *sb;
+      hlist_for_each_entry(sb, &session->committed_blocks[b_hash], cb_hnode) {
+            if (sb->block == snap_block->block) {
+                  spin_unlock(&session->cb_locks[b_hash]);
+
+                  AUDIT log_info("record_block_on_write_callback: Block %d is "
+                                 "already committed\n",
+                                 snap_block->block);
+
+                  kfree(snap_block);
+                  return -BLOCK_COMMITTED;
+            }
+      }
+
+      hlist_add_head(&snap_block->cb_hnode, &session->committed_blocks[b_hash]);
+      spin_unlock(&session->cb_locks[b_hash]);
+
+      // Add the block to the reading blocks
+      spin_lock(&session->rb_locks[b_hash]);
+      hlist_add_head(&snap_block->rb_hnode, &session->reading_blocks[b_hash]);
+      spin_unlock(&session->rb_locks[b_hash]);
 
       return 0;
 }
 
-// struct out_log {
-//       blog_entry **entries;
-//       u32 num_entries;
-// };
+struct write_kretprobe_metadata {
+      dev_t dev;
+      sector_t block;
+};
 
-// Build the log that contains the original block data being overwritten
-// static int build_block_log(struct inode *inode, loff_t offset, size_t count,
-//                            struct path snap_path, struct out_log *out) {
-//       struct super_block *sb;
-//       sector_t first_block, last_block, block;
-//       unsigned int blocksize;
-//       struct buffer_head *bh = NULL;
-//       int num_blocks, index = 0;
-//       int error;
+static int pre_write_handler(struct file *file, loff_t offset, size_t count,
+                             struct write_kretprobe_metadata *out_meta) {
+      struct write_metadata wm;
+      int ret;
 
-//       // Compute block range
-//       first_block = offset >> inode->i_blkbits;
-//       last_block = (offset + count - 1) >> inode->i_blkbits;
-//       DEBUG_ASSERT(first_block <= last_block);
+      if (!file || !file->f_inode)
+            return -EINVAL;
 
-//       blocksize = 1 << inode->i_blkbits;
-//       num_blocks = last_block - first_block + 1;
+      struct inode *inode = igrab(file->f_inode);
+      if (!inode->i_sb->s_bdev) {
+            iput(inode);
+            return -NOSDEV;
+      }
+      dev_t dev = inode->i_sb->s_bdev->bd_dev;
 
-//       out->entries = kmalloc(num_blocks * sizeof(blog_entry *), GFP_ATOMIC);
-//       if (!out->entries)
-//             return -ENOMEM;
+      wm.inode = inode;
+      wm.offset = offset;
+      wm.count = count;
 
-//       for (int i = 0; i < num_blocks; i++)
-//             out->entries[i] = NULL;
+      // Record the block that will be overwritten. If the device is not
+      // registered and has no active session it simply won't perform any
+      // action.
+      ret = rcu_compute_on_sdev(dev, &wm, record_block_on_write_callback);
+      if (!ret) {
+            out_meta->dev = dev;
+            out_meta->block = wm.out_block;
+      }
 
-//       sb = inode->i_sb;
+      iput(inode);
+      return ret;
+}
 
-//       // Process each block in the range
-//       for (block = first_block; block <= last_block; block++) {
-//             blog_entry *entry = NULL;
-//             sector_t phys_block = bmap(inode, block);
+static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
+      sector_t block;
+      snapshot_session *session;
 
-//             if (!phys_block) {
-//                   error = -NOPHYSBLOCK;
-//                   goto cleanup;
-//             }
+      DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
 
-//             bh = sb_bread(sb, phys_block);
-//             if (!bh) {
-//                   AUDIT log_err("Failed to read block %llu\n",
-//                                 (unsigned long long)phys_block);
-//                   error = -NOBHEAD;
-//                   goto cleanup;
-//             }
-//             DEBUG_ASSERT(bh->b_size == blocksize);
+      session = sdev->session;
+      block = *((sector_t *)arg);
 
-//             entry = kmalloc(sizeof(blog_entry), GFP_KERNEL);
-//             if (!entry) {
-//                   error = -ENOMEM;
-//                   goto cleanup;
-//             }
+      u32 b_hash = hash_block(block);
 
-//             entry->orig_data = kmalloc(blocksize, GFP_KERNEL);
-//             if (!entry->orig_data) {
-//                   kfree(entry);
-//                   error = -ENOMEM;
-//                   goto cleanup;
-//             }
+      // Remove the block from the committed blocks
+      spin_lock(&session->cb_locks[b_hash]);
 
-//             // Store block information
-//             entry->block = block;
-//             entry->data_size = blocksize;
-//             entry->snap_path = s_refs->snap_path;
-//             memcpy(entry->orig_data, bh->b_data, blocksize);
+      struct snap_block *sb;
+      bool found = false;
+      hlist_for_each_entry(sb, &session->committed_blocks[b_hash], cb_hnode) {
+            if (sb->block == block) {
+                  found = true;
+                  hlist_del(&sb->cb_hnode);
+                  spin_unlock(&session->cb_locks[b_hash]);
 
-//             // Save the entry and cleanup buffer head
-//             out->entries[index++] = entry;
-//             brelse(bh);
-//             bh = NULL;
-//       }
-//       out->num_entries = num_blocks;
+                  break;
+            }
+      }
+      DEBUG_ASSERT(found);
 
-//       return 0;
+      // Remove the block from the reading blocks
+      spin_lock(&session->rb_locks[b_hash]);
+      hlist_del(&sb->rb_hnode);
+      spin_unlock(&session->rb_locks[b_hash]);
 
-// cleanup:
-//       if (bh)
-//             brelse(bh);
-//       for (int i = 0; i < index; i++)
-//             kfree(out->entries[i]);
-//       kfree(out->entries);
-//       return error;
-// }
+      kfree(sb);
 
-// struct write_params {
-//       struct file *file;
-//       loff_t offset;
-//       size_t count;
-// };
+      return 0;
+}
 
-// static int pre_write_handler(struct write_params *params, struct out_log
-// *log) {
-//       struct path snap_path;
-//       int error;
+static int vfs_write_entry_handler(struct kretprobe_instance *ri,
+                                   struct pt_regs *regs) {
+      struct file *file;
+      size_t count;
+      loff_t offset;
+      int ret;
+#ifdef CONFIG_X86_64
+      file = (struct file *)regs->di;
+      count = (size_t)regs->dx;
+      offset = (loff_t *)regs->cx;
 
-//       struct file *file = params->file;
-//       loff_t offset = params->offset;
-//       size_t count = params->count;
-//       if (!file || !file->f_inode)
-//             return -EINVAL;
+      struct write_kretprobe_metadata *meta =
+          (struct write_kretprobe_metadata *)ri->data;
 
-//       struct inode *inode = igrab(file->f_inode);
-//       if (!inode->i_sb->s_bdev) {
-//             iput(inode);
-//             return -NOSDEV;
-//       }
-//       dev_t dev = inode->i_sb->s_bdev->bd_dev;
+      ret = pre_write_handler(file, offset, count, meta);
+      if (ret) {
+            // Do not execute the ret handler
+            return -1;
+      }
 
-//       // If the snapshot device is not registered, it simply returns an error
-//       error = rcu_compute_on_sdev(dev, &snap_path, sdev_session_path);
-//       if (error) {
-//             iput(inode);
-//             return error;
-//       }
-//       error = build_block_log(inode, offset, count, snap_path, log);
+      return 0;
+#else
+#error "Unsupported architecture"
+#endif
+}
 
-//       return error;
-// }
+static int vfs_write_ret_handler(struct kretprobe_instance *ri,
+                                 struct pt_regs *regs) {
+      ssize_t ret;
+      struct write_kretprobe_metadata *meta;
 
-// static int vfs_write_entry_handler(struct kretprobe_instance *ri,
-//                                    struct pt_regs *regs) {
-//       struct out_log *log = (struct out_log *)ri->data;
-//       struct write_params params;
-//       int error;
-// #ifdef CONFIG_X86_64
-//       params.file = (struct file *)regs->di;
-//       params.count = (size_t)regs->dx;
-//       params.offset = (loff_t *)regs->cx;
+      ret = *((ssize_t *)regs_return_value(regs));
+      meta = (struct write_kretprobe_metadata *)ri->data;
 
-//       error = pre_write_handler(&params, log);
-//       if (error) {
-//             return -1;
-//       }
+      if (ret < 0) {
+            // An error occured: we must "rollback" what the pre_handler did
+            rcu_compute_on_sdev(meta->dev, (void *)&meta->block,
+                                rollback_write_entry_callback);
+      }
 
-//       return 0;
-// #else
-// #error "Unsupported architecture"
-// #endif
-// }
+      return 0;
+}
 
-// static struct kretprobe rp_vfs_write = {
-//     .kp.symbol_name = "vfs_write",
-//     .entry_handler = vfs_write_entry_handler,
-//     // TODO .handler = vfs_write_ret_handler,
-//     .data_size = sizeof(struct out_log),
-// };
+static struct kretprobe rp_vfs_write = {
+    .kp.symbol_name = "vfs_write",
+    .entry_handler = vfs_write_entry_handler,
+    .handler = vfs_write_ret_handler,
+    .data_size = sizeof(struct write_kretprobe_metadata),
+};
 
-static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount};
+static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write};
 
 int register_my_kretprobes(void) {
       int i, ret;

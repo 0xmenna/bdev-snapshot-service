@@ -20,7 +20,7 @@
 #include "hlist_rcu.h"
 #include "utils.h"
 
-#define COMMITTED_HASH_BITS 16
+#define S_BLOCKS_HASH_BITS 16
 #define HASH_BITS 8
 
 #define NODEV 1
@@ -40,6 +40,7 @@
 #define SNAPDIR_EXIST 15
 #define FREE_RCU 16
 #define NOFDEV 17
+#define BLOCK_COMMITTED 18
 
 #define AUDIT if (1)
 
@@ -196,26 +197,29 @@ typedef struct generic_dev {
       };
 } generic_dev_t;
 
-struct committed_block {
+struct snap_block {
       sector_t block;
-      struct hlist_node hnode;
+      struct hlist_node cb_hnode;
+      struct hlist_node rb_hnode;
 };
 
-/**
- * @session_id:  Unique session identifier.
- * @mount_timestamp:  Unix timestamp (u64) when the session was activated.
- * @snap_path:    Snapshot directory path (e.g.,
- * "/snapshot/devname_timestamp").
- * @committed_blocks:  Hash table for committed blocks (i.e. blocks that
- * eventually go to storage).
- * @locks:      Spinlocks for each hash table entry.
- *
- */
+static inline void INIT_SNAP_BLOCK(struct snap_block *sb, sector_t block) {
+      sb->block = block;
+      INIT_HLIST_NODE(&sb->cb_hnode);
+      INIT_HLIST_NODE(&sb->rb_hnode);
+}
+
+static inline u32 hash_block(sector_t block) {
+      return hash_64(block, S_BLOCKS_HASH_BITS);
+}
+
 typedef struct _snapshot_session {
       u64 mount_timestamp;
       struct path snap_path;
-      struct hlist_head committed_blocks[1 << COMMITTED_HASH_BITS];
-      spinlock_t locks[1 << COMMITTED_HASH_BITS];
+      struct hlist_head reading_blocks[1 << S_BLOCKS_HASH_BITS];
+      spinlock_t rb_locks[1 << S_BLOCKS_HASH_BITS];
+      struct hlist_head committed_blocks[1 << S_BLOCKS_HASH_BITS];
+      spinlock_t cb_locks[1 << S_BLOCKS_HASH_BITS];
 } snapshot_session;
 
 static inline void init_snapshot_session(snapshot_session *snap_session,
@@ -290,13 +294,13 @@ static void free_sdev(snap_device *sdev) {
             path_put(&session->snap_path);
 
             // Free all allocated committed blocks
-            for (i = 0; i < (1 << COMMITTED_HASH_BITS); i++) {
-                  struct committed_block *cb;
+            for (i = 0; i < (1 << S_BLOCKS_HASH_BITS); i++) {
+                  struct snap_block *sb;
                   struct hlist_node *tmp;
                   hlist_for_each_entry_safe(
-                      cb, tmp, &session->committed_blocks[i], hnode) {
-                        hlist_del(&cb->hnode);
-                        kfree(cb);
+                      sb, tmp, &session->committed_blocks[i], cb_hnode) {
+                        hlist_del(&sb->cb_hnode);
+                        kfree(sb);
                   }
             }
             kfree(session);

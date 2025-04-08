@@ -43,4 +43,8 @@ int copy_params_from_user(const char __user *dev_name,
                           const char __user *passwd,
                           struct snapshot_args *args);
 
+// Get the physical block number on the device based on the offset and the inode
+// of a given file
+sector_t get_block(struct inode *inode, loff_t offset);
+
 #endif

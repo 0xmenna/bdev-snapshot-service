@@ -55,3 +55,18 @@ int copy_params_from_user(const char __user *dev_name,
 
       return 0;
 }
+
+#define DEFAULT_BLOCK_SIZE 4096
+
+// As of now we support the singlefilefs, therefore we know that a
+// physical block is given by: [ (offset / blocksize) + 2 ]
+// TODO: It would be nice to support all file systems that use the bmap function
+// (https://elixir.bootlin.com/linux/v6.8/source/fs/inode.c#L1771)
+sector_t get_block(struct inode *inode, loff_t offset) {
+      sector_t block = offset / DEFAULT_BLOCK_SIZE + 2;
+
+      //     // This is equivalent to (offset / blocksize) + 2
+      //     sector_t block = (offset >> inode->i_blkbits) + 2;
+
+      return block;
+}
