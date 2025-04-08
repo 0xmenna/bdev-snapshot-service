@@ -134,8 +134,6 @@ static int session_path_callback(snap_device *sdev, void *arg) {
       // Allocate a new dentry for the subdirectory
       subdentry = d_alloc_name(snapshot_root_path.dentry, snap_subdirname);
       if (!subdentry) {
-            AUDIT log_err("Failed to allocate dentry for %s\n",
-                          snap_subdirname);
             return -ENOMEM;
       }
 
@@ -147,8 +145,7 @@ static int session_path_callback(snap_device *sdev, void *arg) {
                   // Other threads may have created the directory
                   ret = -SNAPDIR_EXIST;
             }
-            AUDIT log_err("vfs_mkdir failed for %s: %d\n", snap_subdirname,
-                          ret);
+
             goto out;
       }
       // At this point, a single thread will execute this code for a given snap
@@ -165,8 +162,6 @@ static int session_path_callback(snap_device *sdev, void *arg) {
       ret =
           kern_path(snap_dirname, LOOKUP_FOLLOW, &new_sdev->session->snap_path);
       if (ret) {
-            AUDIT log_err("Failed to lookup new directory %s: %d\n",
-                          snap_dirname, ret);
             kfree(new_sdev);
             goto out;
       }
@@ -188,8 +183,6 @@ static int register_device(const char *dev_name) {
       // Try to initialize the device
       error = get_dev_by_name(dev_name, &dev);
       if (error) {
-            AUDIT log_err("Failed to initialize device %s: %d\n", dev_name,
-                          error);
             return error;
       }
 
@@ -201,9 +194,9 @@ static int register_device(const char *dev_name) {
             error =
                 rcu_compute_on_sdev(d_num(&tmp_sdev), NULL, no_sdev_callback);
             if (error) {
-                  AUDIT log_err("Device %d is already registered\n",
-                                d_num(&tmp_sdev));
-
+                  log_info("Cannot register device: Block device %d already "
+                           "registered\n",
+                           tmp_sdev.dev);
                   return error;
             }
             sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
@@ -214,15 +207,17 @@ static int register_device(const char *dev_name) {
 
             // Register the snapshot device
             rcu_register_snapdevice(sdev);
+            log_info("Device Registered: Block device %d\n", sdev->dev);
             break;
       case FDEV:
             // Check if the device file is already registered
             error = rcu_compute_on_filedev(dev.fdev.dentry, NULL,
                                            no_file_dev_callback);
             if (error) {
+                  log_info("Cannot register device: Loop backing file %s "
+                           "already registered\n",
+                           dev.fdev.dentry->d_name.name);
                   put_fdev(&dev.fdev);
-                  AUDIT log_err("Device file %s is already registered\n",
-                                dev_name);
                   return error;
             }
 
@@ -234,6 +229,8 @@ static int register_device(const char *dev_name) {
             memcpy(fdev, &dev.fdev, sizeof(file_dev_t));
 
             rcu_register_filedev(fdev);
+            log_info("Device Registered: Loop backing file %s\n",
+                     fdev->dentry->d_name.name);
       }
 
       return 0;
@@ -252,6 +249,10 @@ static int unregister_device(const char *dev_name) {
       case BDEV:
             error = rcu_compute_on_sdev(dev.dev, NULL, remove_sdev_callback);
             if (error) {
+                  log_info("Unregister Device: Cannot remove block device %d. "
+                           "Error: "
+                           "%d\n",
+                           dev.dev, error);
                   return error;
             }
             break;
@@ -261,6 +262,10 @@ static int unregister_device(const char *dev_name) {
                                            remove_fdev_callback);
             put_fdev(&dev.fdev);
             if (error) {
+                  log_info(
+                      "Unregister Device: Cannot remove loop backing file %s. "
+                      "Error: %d\n",
+                      dev.fdev.dentry->d_name.name, error);
                   return error;
             }
       }
@@ -311,11 +316,7 @@ cleanup_root:
       return error;
 }
 
-void put_snapshot_path(void) {
-      path_put(&snapshot_root_path);
-
-      log_info("Snapshot path released\n");
-}
+void put_snapshot_path(void) { path_put(&snapshot_root_path); }
 
 // Create a new snapshot session on mount of a registered snapshot device. It
 // is used as a callback for the `rcu_compute_on_sdev` function.
@@ -362,12 +363,11 @@ static inline int map_filedev_callback(file_dev_t *fdev, void *arg) {
       }
 
       old_fdev = fdev;
+      map = *((bool *)arg);
 
       if (old_fdev->is_mapped == map) {
             return 0;
       }
-
-      map = *((bool *)arg);
 
       new_fdev = kmalloc(sizeof(file_dev_t), GFP_ATOMIC);
       if (!new_fdev) {
@@ -408,7 +408,9 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                   // Check if the backing file is registered within the
                   // `fdevices` list
                   ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
-                                               NULL, lo_backing_file_exists);
+                                               NULL,
+                                               lo_backing_file_exists_callback);
+
                   if (ret) {
                         // The device-file is not registered
                         goto ret_handler;
@@ -421,10 +423,8 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
 
                   ret = rcu_compute_on_sdev(d_num(&tmp_sdev), NULL,
                                             no_sdev_callback);
-                  if (unlikely(ret)) {
-                        AUDIT log_err("Loop device %d was already registered\n",
-                                      d_num(&tmp_sdev));
 
+                  if (unlikely(ret)) {
                         goto ret_handler;
                   }
                   sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
@@ -450,12 +450,17 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
 
                   // Register the snapshot device
                   rcu_register_snapdevice(sdev);
+                  AUDIT log_info(
+                      "mount_ret_handler: loop device %d registered with a new "
+                      "session. "
+                      "Backing file %s\n",
+                      sdev->dev,
+                      ((struct dentry *)sdev->private_data)->d_name.name);
 
                   // Map the device-file
-                  bool use_mapping = true;
+                  bool map = true;
                   ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
-                                               &use_mapping,
-                                               map_filedev_callback);
+                                               &map, map_filedev_callback);
                   if (ret) {
                         kfree(session);
                         kfree(sdev);
@@ -466,9 +471,12 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                   // A regular block device
 
                   // Don't really care about the error. If the device is not
-                  // registered it simply wont perform any action.
+                  // registered it simply won't perform any action.
                   rcu_compute_on_sdev(bdev->bd_dev, NULL,
                                       new_session_on_mount_callback);
+                  AUDIT log_info(
+                      "mount_ret_handler: new session for block device %d\n",
+                      bdev->bd_dev);
             }
       }
 
@@ -483,8 +491,9 @@ static struct kretprobe rp_mount = {
     .handler = mount_bdev_ret_handler,
 };
 
-// Function to clear the snapshot session on unmount. It is used as a
-// callback for the `rcu_compute_on_sdev` function.
+// Function to clear the snapshot session on unmount. For loop devices it will
+// free the whole loop device. It is used as a callback for the
+// `rcu_compute_on_sdev` function.
 static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
       snap_device *old_sdev, *new_sdev;
       int ret;
@@ -496,15 +505,19 @@ static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
             // Loop device
 
             // Unmap the device-file
-            bool use_mapping = false;
+            bool map = false;
             ret = rcu_compute_on_filedev((struct dentry *)sdev->private_data,
-                                         &use_mapping, map_filedev_callback);
+                                         &map, map_filedev_callback);
             if (ret) {
                   return ret;
             }
 
             // Unregister the snapshot device
             rcu_unregister_snapdevice(sdev);
+            AUDIT log_info("umount_callback: Loop device %d unregistered with "
+                           "backing file %s\n",
+                           sdev->dev,
+                           ((struct dentry *)sdev->private_data)->d_name.name);
       } else {
             // Regular block device
 
@@ -521,6 +534,10 @@ static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
             // Replace the old snapshot device entry with the updated one
             HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
                               hash_dev(d_num(new_sdev)));
+
+            AUDIT log_info(
+                "umount_callback: Cleared session for block device %d\n",
+                old_sdev->dev);
       }
 
       return FREE_SDEV;
@@ -775,7 +792,8 @@ int activate_snapshot(const char *dev_name, const char *passwd) {
       if (!snapshot_auth_verify(passwd)) {
             return -AUTHF;
       }
-      AUDIT log_info("Password verified succesfully\n");
+      AUDIT log_info("Authentication successful during device %s activation\n",
+                     dev_name);
       // Tries to register a new device
       error = register_device(dev_name);
       if (error) {
@@ -799,6 +817,9 @@ int deactivate_snapshot(const char *dev_name, const char *passwd) {
       if (!snapshot_auth_verify(passwd)) {
             return -AUTHF;
       }
+      AUDIT log_info(
+          "Authentication successful during device %s deactivation\n",
+          dev_name);
 
       // Tries to deallocate the snapshot device
       error = unregister_device(dev_name);

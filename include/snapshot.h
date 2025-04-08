@@ -86,10 +86,6 @@ static void rcu_register_filedev(file_dev_t *fdev) {
       spin_lock(&devices.f_lock);
       list_add_rcu(&fdev->node, &devices.fdevices);
       spin_unlock(&devices.f_lock);
-
-      log_info("Registered file-device %s as a backing file for a loop "
-               "device\n",
-               fdev->dentry->d_name.name);
 }
 
 static void rcu_unregister_filedev(file_dev_t *fdev) {
@@ -107,6 +103,10 @@ static void rcu_replace_filedev(file_dev_t *old_fdev, file_dev_t *new_fdev) {
 static inline void put_fdev_callback(struct rcu_head *rcu) {
       file_dev_t *fdev = container_of(rcu, file_dev_t, rcu);
 
+      AUDIT log_info(
+          "Callback free: loop backing file : %s , preempt_count : %d\n",
+          fdev->dentry->d_name.name, preempt_count());
+
       put_fdev(fdev);
       kfree(fdev);
 }
@@ -120,7 +120,8 @@ static inline int no_file_dev_callback(file_dev_t *fdev, void *arg) {
       return 0;
 }
 
-static inline int lo_backing_file_exists(file_dev_t *fdev, void *arg) {
+// Callback function that checks if the device-file is registered
+static inline int lo_backing_file_exists_callback(file_dev_t *fdev, void *arg) {
       if (fdev == NULL) {
             return -NOFDEV;
       }
@@ -132,20 +133,15 @@ static inline int lo_backing_file_exists(file_dev_t *fdev, void *arg) {
 // used as a callback for the `rcu_compute_on_filedev` function.
 static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
       if (!fdev) {
-            log_err("No device-file found for %s\n", fdev->dentry->d_name.name);
             return -NOSDEV;
       }
       if (fdev->is_mapped) {
             // Cannot remove device file because it is mapped to a block
             // device (i.e. has an active session)
-            log_err("Cannot remove device-file %s: active session\n",
-                    fdev->dentry->d_name.name);
             return -SBUSY;
       }
       // Unregister the device
       rcu_unregister_filedev(fdev);
-
-      log_info("Device-file %s unregistered\n", fdev->dentry->d_name.name);
 
       // The free of `fdev` is demanded to the `rcu_compute_on_filedev`
       // function
@@ -275,9 +271,7 @@ typedef struct _snap_device {
 
 extern inline dev_t d_num(snap_device *sdev) { return sdev->dev; }
 
-static inline u32 hash_dev(snap_device *sdev) {
-      return hash_32(sdev->dev, HASH_BITS);
-}
+static inline u32 hash_dev(dev_t dev) { return hash_32(dev, HASH_BITS); }
 
 static inline void INIT_SNAP_DEVICE(snap_device *sdev, dev_t dev) {
       sdev->dev = dev;
@@ -317,7 +311,7 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
       AUDIT log_info(
-          "Callback free (no session): device : %d, preempt_count : %d\n",
+          "Callback free (no session): block device : %d, preempt_count : %d\n",
           d_num(sdev), preempt_count());
 
       kfree(sdev);
@@ -328,7 +322,7 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
 static inline void free_sdev_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
-      AUDIT log_info("Callback free: device : %d, preempt_count : %d\n",
+      AUDIT log_info("Callback free: block device : %d, preempt_count : %d\n",
                      d_num(sdev), preempt_count());
 
       free_sdev(sdev);
@@ -339,8 +333,6 @@ static inline void rcu_register_snapdevice(snap_device *sdev) {
       u32 hash = hash_dev(d_num(sdev));
 
       HLIST_RCU_INSERT(sdev, devices.sdevices, devices.s_locks, hash);
-
-      log_info("New Device %d registered\n", d_num(sdev));
 }
 
 // Remove a snapshot device from the registered devices
@@ -348,8 +340,6 @@ static inline void rcu_unregister_snapdevice(snap_device *sdev) {
       u32 hash = hash_dev(d_num(sdev));
 
       HLIST_RCU_REMOVE(sdev, devices.s_locks, hash);
-
-      log_info("Device %d unregistered\n", d_num(sdev));
 }
 
 // Helper function to check if a snapshot device is not registered. It
@@ -366,20 +356,15 @@ static inline int no_sdev_callback(snap_device *sdev, void *arg) {
 // used as a callback for the `rcu_compute_on_sdev` function.
 static int remove_sdev_callback(snap_device *sdev, void *arg) {
       if (!sdev) {
-            log_err("No snapshot device found for device %d\n", d_num(sdev));
             return -NOSDEV;
       }
       if (sdev->session) {
             // Cannot remove snapshot device because it has an active
             // session
-            log_err("Cannot remove snapshot device %d: active session\n",
-                    d_num(sdev));
             return -SBUSY;
       }
       // Unregister the snapshot device
       rcu_unregister_snapdevice(sdev);
-
-      log_info("Snapshot device %d unregistered\n", d_num(sdev));
 
       // The free of `sdev` is demanded to the `rcu_compute_on_sdev`
       // function

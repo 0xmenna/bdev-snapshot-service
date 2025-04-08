@@ -42,12 +42,12 @@ static long snapshot_ioctl(struct file *file, unsigned int cmd,
 }
 
 static int snapshot_open(struct inode *inode, struct file *file) {
-      AUDIT log_info("Device opened\n");
+      AUDIT log_info("Snapshot device opened\n");
       return 0;
 }
 
 static int snapshot_release(struct inode *inode, struct file *file) {
-      AUDIT log_info("Device closed\n");
+      AUDIT log_info("Snapshot device closed\n");
       return 0;
 }
 
