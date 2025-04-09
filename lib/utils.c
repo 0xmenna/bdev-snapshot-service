@@ -37,10 +37,10 @@ int copy_params_from_user(const char __user *dev_name,
 
       unsigned long dev_len, passw_len;
 
-      dev_len = strnlen_user(dev_name, MAX_DEV_PATH);
+      dev_len = strnlen_user(dev_name, MAX_DEV_LEN);
       passw_len = strnlen_user(passwd, MAX_SECRET_LEN);
 
-      if (dev_len == 0 || dev_len == MAX_DEV_PATH || passw_len == 0 ||
+      if (dev_len == 0 || dev_len == MAX_DEV_LEN || passw_len == 0 ||
           passw_len == MAX_SECRET_LEN) {
             return -EFAULT;
       }
@@ -69,4 +69,13 @@ sector_t get_block(struct inode *inode, loff_t offset) {
       //     sector_t block = (offset >> inode->i_blkbits) + 2;
 
       return block;
+}
+
+void path_to_safe_name(const char *pathname, char *out_pathname, size_t len) {
+      int i;
+
+      for (i = 0; i < len; i++) {
+            out_pathname[i] = (pathname[i] == '/') ? '_' : pathname[i];
+      }
+      out_pathname[len] = '\0';
 }

@@ -13,7 +13,7 @@
 #include <linux/vmalloc.h>
 
 #define MAX_SECRET_LEN 64
-#define MAX_DEV_PATH 1024
+#define MAX_DEV_LEN 1024
 
 // See https://elixir.bootlin.com/linux/v6.8/source/drivers/block/loop.c#L50
 struct loop_device_meta {
@@ -27,7 +27,7 @@ struct loop_device_meta {
 };
 
 struct snapshot_args {
-      char dev_name[MAX_DEV_PATH];
+      char dev_name[MAX_DEV_LEN];
       char passwd[MAX_SECRET_LEN];
 };
 
@@ -46,5 +46,7 @@ int copy_params_from_user(const char __user *dev_name,
 // Get the physical block number on the device based on the offset and the inode
 // of a given file
 sector_t get_block(struct inode *inode, loff_t offset);
+
+void path_to_safe_name(const char *pathname, char *out_pathname, size_t len);
 
 #endif

@@ -81,6 +81,8 @@ static int __init bdev_snapshot_init(void) {
             ret = install_syscalls(the_syscall_table);
       }
 
+      init_per_cpu_work();
+
       return ret;
 }
 
@@ -96,6 +98,8 @@ static void __exit bdev_snapshot_exit(void) {
       if (the_syscall_table != 0x0) {
             uninstall_syscalls(the_syscall_table);
       }
+
+      AUDIT debug_no_pending_work();
 }
 
 module_init(bdev_snapshot_init);

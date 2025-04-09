@@ -35,21 +35,15 @@
 #define LIBNAME "SNAPSHOT"
 
 #define AUDIT if (1)
-#define DEBUG
-
-#ifdef DEBUG
-#define DEBUG_ASSERT(cond) BUG_ON(!(cond))
-#else
-#define DEBUG_ASSERT(cond)                                                     \
-      do {                                                                     \
-      } while (0)
-#endif
 
 // Global parent path for snapshot directories
 static struct path snapshot_root_path;
 
-// Per-CPU block log FIFO
-static DEFINE_PER_CPU(block_fifo, cpu_block_fifo);
+// Per-CPU list head to hold block log entries
+static DEFINE_PER_CPU(struct list_head, cpu_blog_list);
+
+// Per-CPU work that consumes the block log entries
+static DEFINE_PER_CPU(struct work_struct, cpu_consumer);
 
 void init_devices(void) { INIT_LIST_HEAD(&devices.fdevices); }
 
@@ -58,13 +52,29 @@ static inline bool may_open_device(const struct path *path) {
              !(path->mnt->mnt_sb->s_iflags & SB_I_NODEV);
 }
 
-static int get_dev_by_name(const char *pathname, generic_dev_t *dev) {
+static int get_dev_by_name(const char *dev_name, generic_dev_t *dev) {
+      char pathname[MAX_DEV_LEN];
       struct inode *inode;
       struct path path;
       int error;
 
-      if (!pathname || !*pathname)
+      int dev_len = strlen(dev_name);
+
+      if (dev_len >= MAX_DEV_LEN || dev_len == 0) {
             return -EINVAL;
+      }
+
+      // Check if the device name is a path
+      if (!strchr(dev_name, '/')) {
+            const char *dev_path = "/dev/";
+            int len = strlen(dev_path) + dev_len;
+            if (len >= MAX_DEV_LEN) {
+                  return -EINVAL;
+            }
+            snprintf(pathname, sizeof(pathname), "%s%s", dev_path, dev_name);
+      } else {
+            snprintf(pathname, sizeof(pathname), "%s", dev_name);
+      }
 
       error = kern_path(pathname, LOOKUP_FOLLOW, &path);
       if (error) {
@@ -72,10 +82,12 @@ static int get_dev_by_name(const char *pathname, generic_dev_t *dev) {
       }
       inode = d_backing_inode(path.dentry);
       if (!S_ISBLK(inode->i_mode)) {
+            char fdev_name[MAX_DEV_LEN];
+            path_to_safe_name(pathname, fdev_name, strlen(pathname));
             // The provided pathname represents the actual pathname associated
             // to the file managed as device-file (used for a loop device).
             file_dev_t fdev;
-            INIT_FDEV(&fdev, path.dentry);
+            INIT_FDEV(&fdev, path.dentry, fdev_name);
             dev->type = FDEV;
             dev->fdev = fdev;
 
@@ -96,87 +108,6 @@ out_path_put:
       return error;
 }
 
-// Function to create a new snapshot session directory. It is used as a
-// callback for the `rcu_compute_on_sdev` function.
-static int session_path_callback(snap_device *sdev, void *arg) {
-      struct tm tm;
-      char date_str[16]; // Format: YYYYMMDD_HHMMSS
-      char snap_subdirname[128];
-      char snap_dirname[128];
-      struct dentry *subdentry = NULL;
-      int ret;
-
-      if (!sdev) {
-            return -NOSDEV;
-      }
-      if (!sdev->session) {
-            return -SDEVNOTACTIVE;
-      }
-
-      if (d_session(sdev->session)) {
-            return -PATHEXIST;
-      }
-
-      // Format the timestamp into a date string: YYYYMMDD_HHMMSS
-      time64_to_tm(sdev->session->mount_timestamp, 0, &tm);
-      snprintf(date_str, sizeof(date_str), "%04ld%02ld%02ld_%02ld%02ld%02ld",
-               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
-               tm.tm_min, tm.tm_sec);
-
-      // Build the snapshot subdirectory name: "<dev_name>_<date_str>"
-      snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%s", dev_name,
-               date_str);
-
-      // Construct the full snapshot directory path
-      snprintf(snap_dirname, sizeof(snap_dirname), "/%s/%s",
-               snapshot_root_path.dentry->d_name.name, snap_subdirname);
-
-      // Allocate a new dentry for the subdirectory
-      subdentry = d_alloc_name(snapshot_root_path.dentry, snap_subdirname);
-      if (!subdentry) {
-            return -ENOMEM;
-      }
-
-      // Create the new directory
-      ret = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
-                      d_inode(snapshot_root_path.dentry), subdentry, 0500);
-      if (ret) {
-            if (ret == -EEXIST) {
-                  // Other threads may have created the directory
-                  ret = -SNAPDIR_EXIST;
-            }
-
-            goto out;
-      }
-      // At this point, a single thread will execute this code for a given snap
-      // device session, because the rest have failed to create the directory.
-      snap_device *old_sdev = sdev;
-      snap_device *new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
-      if (!new_sdev) {
-            ret = -ENOMEM;
-            goto out;
-      }
-      memcpy(new_sdev, old_sdev, sizeof(snap_device));
-
-      // Lookup the full path of the new directory
-      ret =
-          kern_path(snap_dirname, LOOKUP_FOLLOW, &new_sdev->session->snap_path);
-      if (ret) {
-            kfree(new_sdev);
-            goto out;
-      }
-
-      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
-                        hash_dev(d_num(new_sdev)));
-
-      // This is to avoid freeing the session in the callback (since it is used
-      // by the newer snap device)
-      ret = FREE_SDEV_NO_SESSION;
-out:
-      dput(subdentry);
-      return ret;
-};
-
 static int register_device(const char *dev_name) {
       generic_dev_t dev;
       int error;
@@ -189,14 +120,18 @@ static int register_device(const char *dev_name) {
       switch (dev.type) {
       case BDEV:
             snap_device tmp_sdev, *sdev;
-            INIT_SNAP_DEVICE(&tmp_sdev, dev.dev);
+            char safe_name[MAX_DEV_LEN];
+
+            path_to_safe_name(dev_name, safe_name, strlen(dev_name));
+
+            INIT_SNAP_DEVICE(&tmp_sdev, dev.dev, safe_name);
             // Check if the snapshot device is already registered
             error =
                 rcu_compute_on_sdev(d_num(&tmp_sdev), NULL, no_sdev_callback);
             if (error) {
-                  log_info("Cannot register device: Block device %d already "
+                  log_info("Cannot register device: Block device %s already "
                            "registered\n",
-                           tmp_sdev.dev);
+                           sdev_name(&tmp_sdev));
                   return error;
             }
             sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
@@ -207,7 +142,7 @@ static int register_device(const char *dev_name) {
 
             // Register the snapshot device
             rcu_register_snapdevice(sdev);
-            log_info("Device Registered: Block device %d\n", sdev->dev);
+            log_info("Device Registered: Block device %s\n", sdev_name(sdev));
             break;
       case FDEV:
             // Check if the device file is already registered
@@ -217,13 +152,13 @@ static int register_device(const char *dev_name) {
                   log_info("Cannot register device: Loop backing file %s "
                            "already registered\n",
                            dev.fdev.dentry->d_name.name);
-                  put_fdev(&dev.fdev);
+                  dput(dev.fdev.dentry);
                   return error;
             }
 
             file_dev_t *fdev = kmalloc(sizeof(file_dev_t), GFP_KERNEL);
             if (!fdev) {
-                  put_fdev(&dev.fdev);
+                  dput(dev.fdev.dentry);
                   return -ENOMEM;
             }
             memcpy(fdev, &dev.fdev, sizeof(file_dev_t));
@@ -260,12 +195,12 @@ static int unregister_device(const char *dev_name) {
       case FDEV:
             error = rcu_compute_on_filedev(dev.fdev.dentry, NULL,
                                            remove_fdev_callback);
-            put_fdev(&dev.fdev);
+            dput(dev.fdev.dentry);
             if (error) {
                   log_info(
                       "Unregister Device: Cannot remove loop backing file %s. "
                       "Error: %d\n",
-                      dev.fdev.dentry->d_name.name, error);
+                      fdev_name(&dev.fdev), error);
                   return error;
             }
       }
@@ -317,6 +252,128 @@ cleanup_root:
 }
 
 void put_snapshot_path(void) { path_put(&snapshot_root_path); }
+
+// Function to create a new snapshot session directory. It is used as a
+// callback for the `rcu_compute_on_sdev` function.
+static int session_path_callback(snap_device *sdev, void *arg) {
+      struct tm tm;
+      char date_str[16]; // Format: YYYYMMDD_HHMMSS
+      char snap_subdirname[1056];
+      char snap_dirname[1056];
+      struct dentry *subdentry = NULL;
+      int ret;
+
+      DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
+
+      if (d_session(sdev->session)) {
+            return -PATHEXIST;
+      }
+
+      // Format the timestamp into a date string: YYYYMMDD_HHMMSS
+      time64_to_tm(sdev->session->mount_timestamp, 0, &tm);
+      snprintf(date_str, sizeof(date_str), "%04ld%02ld%02ld_%02ld%02ld%02ld",
+               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+               tm.tm_min, tm.tm_sec);
+
+      // Build the snapshot subdirectory name: "<dev_name>_<date_str>"
+      snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%s",
+               sdev_name(sdev), date_str);
+
+      // Construct the full snapshot directory path
+      snprintf(snap_dirname, sizeof(snap_dirname), "/%s/%s",
+               snapshot_root_path.dentry->d_name.name, snap_subdirname);
+
+      // Allocate a new dentry for the subdirectory
+      subdentry = d_alloc_name(snapshot_root_path.dentry, snap_subdirname);
+      if (!subdentry) {
+            return -ENOMEM;
+      }
+
+      // Create the new directory
+      ret = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
+                      d_inode(snapshot_root_path.dentry), subdentry, 0550);
+      if (ret) {
+            if (ret == -EEXIST) {
+                  // Other threads may have created the directory
+                  ret = -SNAPDIR_EXIST;
+            }
+
+            goto out;
+      }
+      // At this point, a single thread will execute this code for a given snap
+      // device session, because the rest have failed to create the directory.
+      snap_device *old_sdev = sdev;
+      snap_device *new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
+      if (!new_sdev) {
+            ret = -ENOMEM;
+            goto out;
+      }
+      memcpy(new_sdev, old_sdev, sizeof(snap_device));
+
+      // Lookup the full path of the new directory
+      ret =
+          kern_path(snap_dirname, LOOKUP_FOLLOW, &new_sdev->session->snap_path);
+      if (ret) {
+            kfree(new_sdev);
+            goto out;
+      }
+
+      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
+                        hash_dev(d_num(new_sdev)));
+
+      // This is to avoid freeing the session in the callback (since it is used
+      // by the newer snap device)
+      ret = FREE_SDEV_NO_SESSION;
+out:
+      dput(subdentry);
+      return ret;
+};
+
+// Consumes a block log entry. Used by the consumer deferred worker
+// TODO: Implement the logic to consume the block log entry
+static int consume_block(blog_entry *bentry) {
+      dev_t dev = bentry->inode->i_sb->s_bdev->bd_dev;
+
+      if (!bentry->snap_path.dentry) {
+            // TODO: Must create the device snapshot directory
+      }
+      return 0;
+}
+
+// Worker function that consumes the block log entries
+static void consume_blocks_worker(struct work_struct *work) {
+      blog_entry *entry, *tmp;
+      int ret;
+
+      struct list_head *blist = this_cpu_ptr(&cpu_blog_list);
+
+      list_for_each_entry_safe(entry, tmp, blist, node) {
+            list_del(&entry->node);
+
+            ret = consume_block(entry);
+            // TODO: Handle the return value
+            kfree(entry);
+      }
+}
+
+void init_per_cpu_work(void) {
+      int cpu;
+      for_each_possible_cpu(cpu) {
+            struct list_head *blist = per_cpu_ptr(&cpu_blog_list, cpu);
+            struct work_struct *consumer = per_cpu_ptr(&cpu_consumer, cpu);
+
+            INIT_LIST_HEAD(blist);
+            INIT_WORK(consumer, consume_blocks_worker);
+      }
+}
+
+void debug_no_pending_work(void) {
+      int cpu;
+      for_each_possible_cpu(cpu) {
+            DEBUG_ASSERT(!work_pending(&per_cpu(cpu_consumer, cpu)));
+            DEBUG_ASSERT(list_empty(per_cpu_ptr(&cpu_blog_list, cpu)));
+      }
+}
 
 // Create a new snapshot session on mount of a registered snapshot device. It
 // is used as a callback for the `rcu_compute_on_sdev` function.
@@ -378,7 +435,7 @@ static inline int map_filedev_callback(file_dev_t *fdev, void *arg) {
 
       rcu_replace_filedev(old_fdev, new_fdev);
 
-      get_fdev(new_fdev);
+      dget(new_fdev->dentry);
 
       return FREE_RCU;
 }
@@ -406,9 +463,10 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                           ->lo_backing_file;
 
                   // Check if the backing file is registered within the
-                  // `fdevices` list
+                  // `fdevices` list. If it is we also get the device name
+                  char *dev_name;
                   ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
-                                               NULL,
+                                               &dev_name,
                                                lo_backing_file_exists_callback);
 
                   if (ret) {
@@ -419,7 +477,7 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                   // The device-file is registered. We can create a new snapshot
                   // device and activate a new session
                   snap_device tmp_sdev, *sdev;
-                  INIT_SNAP_DEVICE(&tmp_sdev, bdev->bd_dev);
+                  INIT_SNAP_DEVICE(&tmp_sdev, bdev->bd_dev, dev_name);
 
                   ret = rcu_compute_on_sdev(d_num(&tmp_sdev), NULL,
                                             no_sdev_callback);
@@ -454,8 +512,7 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                       "mount_ret_handler: loop device %d registered with a new "
                       "session. "
                       "Backing file %s\n",
-                      sdev->dev,
-                      ((struct dentry *)sdev->private_data)->d_name.name);
+                      sdev->dev, sdev_name(sdev));
 
                   // Map the device-file
                   bool map = true;
@@ -516,8 +573,7 @@ static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
             rcu_unregister_snapdevice(sdev);
             AUDIT log_info("umount_callback: Loop device %d unregistered with "
                            "backing file %s\n",
-                           sdev->dev,
-                           ((struct dentry *)sdev->private_data)->d_name.name);
+                           sdev->dev, sdev_name(sdev));
       } else {
             // Regular block device
 
@@ -536,8 +592,8 @@ static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
                               hash_dev(d_num(new_sdev)));
 
             AUDIT log_info(
-                "umount_callback: Cleared session for block device %d\n",
-                old_sdev->dev);
+                "umount_callback: Cleared session for block device %s\n",
+                sdev_name(old_sdev));
       }
 
       return FREE_SDEV;
@@ -626,7 +682,7 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
             return -ENOMEM;
       }
 
-      INIT_SNAP_BLOCK(snap_block, block);
+      INIT_SNAP_BLOCK(snap_block, wm->inode, block);
       u32 b_hash = hash_block(snap_block->block);
 
       // Add the block to the committed blocks (if it does not exist already)
@@ -637,9 +693,10 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
             if (sb->block == snap_block->block) {
                   spin_unlock(&session->cb_locks[b_hash]);
 
-                  AUDIT log_info("record_block_on_write_callback: Block %d is "
+                  AUDIT log_info("record_block_on_write_callback: Snapshot "
+                                 "device : %s; Block %d is "
                                  "already committed\n",
-                                 snap_block->block);
+                                 sdev_name(sdev), snap_block->block);
 
                   kfree(snap_block);
                   return -BLOCK_COMMITTED;
@@ -651,6 +708,10 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
 
       // Add the block to the reading blocks
       spin_lock(&session->rb_locks[b_hash]);
+      // inode chain step 2. The inode is held by the `snap_block` and stored in
+      // the reading_blocks. The `snap_block` is also stored in the committed
+      // list, but the lifecycle of the inode is only dependent to the
+      // `rading_blocks` list.
       hlist_add_head(&snap_block->rb_hnode, &session->reading_blocks[b_hash]);
       spin_unlock(&session->rb_locks[b_hash]);
 
@@ -670,6 +731,11 @@ static int pre_write_handler(struct file *file, loff_t offset, size_t count,
       if (!file || !file->f_inode)
             return -EINVAL;
 
+      // This inode will traverse a chain. If it passes through all steps, it
+      // will be released at the end of the deferred working process. If one of
+      // the steps fails to go through, it will be released before.
+
+      // inode chain step 1.
       struct inode *inode = igrab(file->f_inode);
       if (!inode->i_sb->s_bdev) {
             iput(inode);
@@ -684,16 +750,22 @@ static int pre_write_handler(struct file *file, loff_t offset, size_t count,
       // Record the block that will be overwritten. If the device is not
       // registered and has no active session it simply won't perform any
       // action.
+      // Reminder: we support a single block write at a time
       ret = rcu_compute_on_sdev(dev, &wm, record_block_on_write_callback);
-      if (!ret) {
+      if (ret) {
+            // End of inode chain at step 1.
+            iput(inode);
+      } else {
             out_meta->dev = dev;
             out_meta->block = wm.out_block;
       }
 
-      iput(inode);
       return ret;
 }
 
+// Callback that rollbacks the block commitment performed during a write
+// operation pre handler. It deletes an entry for both the `committed_blocks`
+// and the `reading blocks` lists. Finally, it frees the deleted node.
 static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
       sector_t block;
       snapshot_session *session;
@@ -726,7 +798,9 @@ static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
       hlist_del(&sb->rb_hnode);
       spin_unlock(&session->rb_locks[b_hash]);
 
-      kfree(sb);
+      // the inode is released during this free.
+      // End of inode chain at step 2.
+      sb_free(sb);
 
       return 0;
 }
@@ -779,6 +853,160 @@ static struct kretprobe rp_vfs_write = {
     .entry_handler = vfs_write_entry_handler,
     .handler = vfs_write_ret_handler,
     .data_size = sizeof(struct write_kretprobe_metadata),
+};
+
+struct sb_read_kretprobe_metadata {
+      sector_t block;
+
+      struct inode *inode;
+      struct path snap_path;
+};
+
+// Callback to check if a read block matches the one in `arg`. If so, the caller
+// receives the inode of the file whose write triggered the block read and the
+// snapshot path, both needed for deferred work.
+static int try_read_block_callback(snap_device *sdev, void *arg) {
+      struct sb_read_kretprobe_metadata *meta;
+      snapshot_session *session;
+
+      if (!sdev) {
+            return -NOSDEV;
+      }
+      if (!sdev->session) {
+            return -SDEVNOTACTIVE;
+      }
+      session = sdev->session;
+      meta = (struct sb_read_kretprobe_metadata *)arg;
+
+      u32 b_hash = hash_block(meta->block);
+
+      // Check wheter there is any block to read and clear it if any
+      spin_lock(&session->rb_locks[b_hash]);
+
+      struct snap_block *sb;
+      hlist_for_each_entry(sb, &session->reading_blocks[b_hash], rb_hnode) {
+            if (sb->block == meta->block) {
+                  hlist_del(&sb->rb_hnode);
+                  spin_unlock(&session->rb_locks[b_hash]);
+
+                  // Inform the caller about the inode of the file whose write
+                  // operation triggered this block read.
+                  // inode chain step 3.
+                  meta->inode = sb->inode;
+                  // The `snap_block` does not care about the inode anymore.
+                  sb->inode = NULL;
+
+                  // Inform the caller also of the snapshot path (needed by the
+                  // deferred worker)
+                  meta->snap_path = session->snap_path;
+
+                  // No need to free `sb` since is used within the
+                  // `committed_blocks`
+
+                  return 0;
+            }
+      }
+
+      spin_unlock(&session->rb_locks[b_hash]);
+
+      return -NO_RBLOCK;
+}
+
+static int sb_read_entry_handler(struct kretprobe_instance *ri,
+                                 struct pt_regs *regs) {
+
+      struct super_block *sb;
+      struct sb_read_kretprobe_metadata *meta;
+      sector_t block;
+      dev_t dev;
+      int ret;
+
+#ifdef CONFIG_X86_64
+      sb = (struct super_block *)regs->di;
+      block = (sector_t)regs->dx;
+      meta = (struct sb_read_kretprobe_metadata *)ri->data;
+
+      if (!sb->s_bdev) {
+            return -1;
+      }
+      dev = sb->s_bdev->bd_dev;
+
+      // Check wheter to read the block or not.
+      // If the block must be read, then consume the node from the session
+      // reading block list
+      meta->block = block;
+      ret = rcu_compute_on_sdev(dev, (void *)meta, try_read_block_callback);
+      if (ret) {
+            // No need to copy the block: the device is unregistered, has no
+            // active session, or the block is irrelevant to it.
+            return -1;
+      }
+
+      DEBUG_ASSERT(dev == meta->inode->i_sb->s_bdev->bd_dev);
+
+      // Execute the return handler: copy the read block and defer VFS-related
+      // work.
+
+      return 0;
+#else
+#error "Unsupported architecture"
+#endif
+}
+
+// If this is executed, than we must copy the block and defer vfs related work
+static int sb_read_ret_handler(struct kretprobe_instance *ri,
+                               struct pt_regs *regs) {
+      struct buffer_head *bh;
+      struct sb_read_kretprobe_metadata *meta;
+      // Log entry used to enqueue the copied block (used in deferred working).
+      blog_entry *bentry;
+      char *bdata;
+
+      bh = (struct buffer_head *)regs_return_value(regs);
+      meta = (struct sb_read_kretprobe_metadata *)ri->data;
+
+      if (!IS_ERR(bh)) {
+            // Allocate a new block log entry
+            bdata = kmalloc(bh->b_size, GFP_ATOMIC);
+            if (!bdata) {
+                  // End of inode chain at step 3.
+                  iput(meta->inode);
+                  goto out;
+            }
+            memcpy(bdata, bh->b_data, bh->b_size);
+
+            bentry = kmalloc(sizeof(bentry), GFP_ATOMIC);
+            if (!bentry) {
+                  kfree(bdata);
+                  // End of inode chain at step 3.
+                  iput(meta->inode);
+                  goto out;
+            }
+            INIT_BLOG_ENTRY(bentry, meta->snap_path, meta->block, bdata,
+                            bh->b_size);
+            // inode chain step 4.
+            // It will be the responsibility of the deferred worker to release
+            // it.
+            bentry->inode = meta->inode;
+
+            // Enqueue the block log entry to the per-CPU list and schedule the
+            // consumer.
+            int cpu = smp_processor_id();
+            struct list_head *blist = per_cpu_ptr(&cpu_blog_list, cpu);
+            list_add_tail(&bentry->node, blist);
+
+            schedule_work_on(cpu, per_cpu_ptr(&cpu_consumer, cpu));
+      }
+
+out:
+      return 0;
+}
+
+static struct kretprobe rp_sb_read = {
+    .kp.symbol_name = "sb_bread",
+    .entry_handler = sb_read_entry_handler,
+    .handler = sb_read_ret_handler,
+    .data_size = sizeof(struct sb_read_kretprobe_metadata),
 };
 
 static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write};
