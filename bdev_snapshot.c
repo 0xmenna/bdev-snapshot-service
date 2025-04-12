@@ -29,12 +29,12 @@
 #ifdef CONFIG_X86
 // If no syscall support is needed just leave the syscall table address to 0x0
 unsigned long the_syscall_table = 0x0;
-module_param(the_syscall_table, ulong, 0440);
+module_param(the_syscall_table, ulong, 0660);
 MODULE_PARM_DESC(the_syscall_table, "The syscall table address");
 #endif
 
 static bool snapshot_ioctl = false;
-module_param(snapshot_ioctl, bool, 0440);
+module_param(snapshot_ioctl, bool, 0660);
 MODULE_PARM_DESC(
     snapshot_ioctl,
     "Enable or disable ioctl as an interface for the snapshot service");
@@ -43,9 +43,14 @@ static u8 the_snapshot_secret[MAX_SECRET_LEN];
 module_param_string(the_snapshot_secret, the_snapshot_secret, MAX_SECRET_LEN,
                     0);
 MODULE_PARM_DESC(the_snapshot_secret,
-                 "The snapshot secret used for the authentication of the "
-                 "snapshot service. As soon "
+                 "The snapshot secret used for authentication. As soon "
                  "as its digest is stored, it will be wiped out");
+
+static int wq_max_active = 1;
+module_param(wq_max_active, int, 0660);
+MODULE_PARM_DESC(wq_max_active,
+                 "The maximum number of execution contexts per CPU which can "
+                 "be assigned to the work items of the workqueue.");
 
 static int __init bdev_snapshot_init(void) {
       int ret;
@@ -69,6 +74,11 @@ static int __init bdev_snapshot_init(void) {
             return ret;
       }
 
+      ret = init_work_queue(wq_max_active);
+      if (ret) {
+            return ret;
+      }
+
       ret = register_my_kretprobes();
       if (ret) {
             return ret;
@@ -77,29 +87,25 @@ static int __init bdev_snapshot_init(void) {
       if (snapshot_ioctl)
             ret = init_snapshot_control();
 
-      if (the_syscall_table != 0x0) {
+      if (the_syscall_table != 0x0)
             ret = install_syscalls(the_syscall_table);
-      }
-
-      init_per_cpu_work();
 
       return ret;
 }
 
 static void __exit bdev_snapshot_exit(void) {
 
-      unregister_my_kretprobes();
-
-      put_snapshot_path();
+      if (the_syscall_table != 0x0)
+            uninstall_syscalls(the_syscall_table);
 
       if (snapshot_ioctl)
             cleanup_snapshot_control();
 
-      if (the_syscall_table != 0x0) {
-            uninstall_syscalls(the_syscall_table);
-      }
+      unregister_my_kretprobes();
 
-      AUDIT debug_no_pending_work();
+      cleanup_work_queue();
+
+      put_snapshot_path();
 }
 
 module_init(bdev_snapshot_init);

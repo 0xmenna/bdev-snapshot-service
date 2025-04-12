@@ -12,6 +12,13 @@
 
 #define AUDIT if (1)
 
+#define DEVICE_NAME "snap"
+#define CLASS_NAME "snpc"
+
+#define SNAPSHOT_IOCTL_MAGIC 'S'
+#define SNAP_ACTIVATE _IOW(SNAPSHOT_IOCTL_MAGIC, 1, struct snapshot_args)
+#define SNAP_DEACTIVATE _IOW(SNAPSHOT_IOCTL_MAGIC, 2, struct snapshot_args)
+
 static dev_t dev_number;
 static struct class *snapshot_class;
 static struct cdev snapshot_cdev;
@@ -88,7 +95,7 @@ int init_snapshot_control(void) {
             return PTR_ERR(snapshot_class);
       }
 
-      // Create /dev/snapshot
+      // Create /dev/snap
       if (!device_create(snapshot_class, NULL, dev_number, NULL, DEVICE_NAME)) {
             log_err("Failed to create device file\n");
             class_destroy(snapshot_class);

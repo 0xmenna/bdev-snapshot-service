@@ -1,5 +1,5 @@
-#ifndef _HLIST_RCU_H
-#define _HLIST_RCU_H
+#ifndef HLIST_RCU_H
+#define HLIST_RCU_H
 
 #include <linux/hashtable.h>
 #include <linux/jhash.h>

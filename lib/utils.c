@@ -60,13 +60,12 @@ int copy_params_from_user(const char __user *dev_name,
 
 // As of now we support the singlefilefs, therefore we know that a
 // physical block is given by: [ (offset / blocksize) + 2 ]
-// TODO: It would be nice to support all file systems that use the bmap function
+// It would be nice to support all file systems that use the bmap function
 // (https://elixir.bootlin.com/linux/v6.8/source/fs/inode.c#L1771)
 sector_t get_block(struct inode *inode, loff_t offset) {
       sector_t block = offset / DEFAULT_BLOCK_SIZE + 2;
 
-      //     // This is equivalent to (offset / blocksize) + 2
-      //     sector_t block = (offset >> inode->i_blkbits) + 2;
+      // sector_t block = (offset >> inode->i_blkbits) + 2;
 
       return block;
 }
@@ -78,4 +77,17 @@ void path_to_safe_name(const char *pathname, char *out_pathname, size_t len) {
             out_pathname[i] = (pathname[i] == '/') ? '_' : pathname[i];
       }
       out_pathname[len] = '\0';
+}
+
+u32 compute_checksum(const char *data, size_t size, u32 seed) {
+      return crc32(seed, (const unsigned char *)data, size);
+}
+
+u32 hash_str(const char *str, int bits) {
+      u32 hash = jhash(str, strlen(str), 0);
+
+      // Ensure bits is in [1, 32]
+      if (bits >= 32)
+            return hash;
+      return hash & ((1U << bits) - 1);
 }

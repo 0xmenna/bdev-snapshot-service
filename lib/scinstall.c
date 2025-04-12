@@ -138,6 +138,6 @@ void uninstall_syscalls(unsigned long the_syscall_table) {
 }
 
 #else
-int install_syscalls(unsigned long the_syscall_table) { return 0; }
+int install_syscalls(unsigned long the_syscall_table) { return -1; }
 void uninstall_syscalls(unsigned long the_syscall_table) { return; }
 #endif

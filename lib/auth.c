@@ -12,8 +12,6 @@
 #include "../include/auth.h"
 #include "../include/utils.h"
 
-#define LIBNAME "AUTH"
-
 #define AUDIT if (1)
 
 #define DIGEST_SIZE 32
@@ -75,7 +73,7 @@ bool snapshot_auth_verify(const char *passwd) {
       return auth_success;
 }
 
-inline int snapshot_auth_init(const char *passwd) {
+int snapshot_auth_init(const char *passwd) {
       if (strlen(passwd) > MAX_SECRET_LEN - 1) {
             log_err("Initialization password is too long, size must be a "
                     "maximum of %d\n",

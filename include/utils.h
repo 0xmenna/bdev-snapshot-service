@@ -1,9 +1,10 @@
-#ifndef _UTILS_H_
-
-#define _UTILS_H_
+#ifndef UTILS_H
+#define UTILS_H
 
 #include <crypto/hash.h>
+#include <linux/crc32.h>
 #include <linux/err.h>
+#include <linux/jhash.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/root_dev.h>
@@ -48,5 +49,9 @@ int copy_params_from_user(const char __user *dev_name,
 sector_t get_block(struct inode *inode, loff_t offset);
 
 void path_to_safe_name(const char *pathname, char *out_pathname, size_t len);
+
+u32 compute_checksum(const char *data, size_t size, u32 seed);
+
+u32 hash_str(const char *str, int bits);
 
 #endif
