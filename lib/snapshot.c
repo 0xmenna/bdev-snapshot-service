@@ -100,8 +100,9 @@ static inline void rcu_replace_filedev(file_dev_t *old_fdev,
       spin_unlock(&devices.f_lock);
 }
 
-/* Callback function that checks wheter a device-file is already registered. It
-is used within `rcu_compute_on_fdev`. */
+/* Callback functions used within `rcu_compute_on_fdev` */
+
+/* Checks that a device-file is not already registered. */
 static inline int no_file_dev_callback(file_dev_t *fdev, void *arg) {
       if (fdev != NULL) {
             return -DEXIST;
@@ -109,10 +110,9 @@ static inline int no_file_dev_callback(file_dev_t *fdev, void *arg) {
       return 0;
 }
 
-/* Checks if a device-file is already registered and gets its name. It is used
- within `rcu_compute_on_fdev`. */
+/* Checks if a device-file is already registered and gets its name. */
 static inline int lo_backing_file_exists_callback(file_dev_t *fdev, void *arg) {
-      const char *dev_name;
+
       if (fdev == NULL) {
             return -NOFDEV;
       }
@@ -123,8 +123,7 @@ static inline int lo_backing_file_exists_callback(file_dev_t *fdev, void *arg) {
       return 0;
 }
 
-/* Callback function that removes a device-file from the registered devices. It
- is used within `rcu_compute_on_fdev`. */
+/* Removes a device-file from the registered devices. */
 static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
       if (!fdev) {
             return -NOSDEV;
@@ -142,8 +141,7 @@ static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
       return FREE_RCU;
 }
 
-/* Callback function that maps/unmaps a device-file. It is used within
- `rcu_compute_on_fdev`. */
+/* Maps/unmaps a device-file. */
 static inline int map_filedev_callback(file_dev_t *fdev, void *arg) {
       file_dev_t *old_fdev, *new_fdev;
       bool map;
@@ -238,7 +236,7 @@ static inline void rcu_unregister_snapdevice(snap_device *sdev) {
       HLIST_RCU_REMOVE(sdev, devices.s_locks, hash);
 }
 
-/* Callback function that checks if a snapshot device is not registered. It is
+/* Callback function that checks that a snapshot device is not registered. It is
 used within `rcu_compute_on_sdev`. */
 static inline int no_sdev_callback(snap_device *sdev, void *arg) {
       if (sdev != NULL) {
@@ -272,12 +270,12 @@ struct session_dentry_metadata {
       bool is_owner;
 };
 
-/* Create a new snapshot session directory and get its associated dentry. */
+/* Create a new snapshot session directory and get its associated dentry. It is
+ used within `rcu_compute_on_sdev`. */
 static int session_dentry_callback(snap_device *sdev, void *arg) {
       struct tm tm;
       char date_str[16]; // Format: YYYYMMDD_HHMMSS
       char snap_subdirname[1056];
-      char snap_dirname[1056];
       struct dentry *session_dentry = NULL;
       int ret;
 
@@ -302,10 +300,6 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
       snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%s",
                sdev_name(sdev), date_str);
 
-      // Construct the full snapshot directory path
-      snprintf(snap_dirname, sizeof(snap_dirname), "/%s/%s",
-               snapshot_root_path.dentry->d_name.name, snap_subdirname);
-
       // Allocate a new dentry for the subdirectory
       session_dentry = d_alloc_name(snapshot_root_path.dentry, snap_subdirname);
       if (!session_dentry) {
@@ -324,6 +318,9 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
 
             return ret;
       }
+      log_info("Created snapshot session directory: %s\n",
+               session_dentry->d_name.name);
+
       // At this point, a single thread will execute this code for a given snap
       // device session, because the rest have failed to create the directory.
       snap_device *old_sdev = sdev;
@@ -345,9 +342,10 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
       // This is to avoid freeing the session in the callback (since it is used
       // by the newer snap device)
       return FREE_SDEV_NO_SESSION;
-};
+}
 
-/* Create a new snapshot session on mount of a registered snapshot device. */
+/* Create a new snapshot session on mount of a registered snapshot device.
+It is used within `rcu_compute_on_sdev`. */
 static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
       snap_device *old_sdev, *new_sdev;
       snapshot_session *session;
@@ -383,6 +381,8 @@ static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
       return FREE_SDEV;
 }
 
+/* Frees a per-cpu session container. It is executed asyncronously within
+`on_each_cpu` function. */
 static void free_percpu_session_container(void *info) {
       struct hlist_head *containers = this_cpu_ptr(session_containers);
       struct dentry *snap_dentry = info;
@@ -395,6 +395,10 @@ static void free_percpu_session_container(void *info) {
       };
       hlist_for_each_entry(entry, &containers[hash], hnode) {
             if (containers_cmp(entry, &container_lookup)) {
+                  AUDIT log_info(
+                      "Freeing session container. CPU: %d. Session: %s\n",
+                      smp_processor_id(), entry->session_dentry->d_name.name);
+
                   hlist_del(&entry->hnode);
 
                   filp_close(entry->file, NULL);
@@ -405,7 +409,7 @@ static void free_percpu_session_container(void *info) {
       }
 }
 
-// Free a snapshot device and its session
+/* Frees a snapshot device and its session */
 static void free_sdev(snap_device *sdev) {
       if (sdev->session) {
             snapshot_session *session = sdev->session;
@@ -434,8 +438,8 @@ static void free_sdev(snap_device *sdev) {
       kfree(sdev);
 }
 
-// Callback to free a snapshot device without its session within async RCU
-// context
+/* Callback to free a snapshot device without its session. Used within
+ * `call_rcu` function. */
 static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
@@ -446,8 +450,8 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
       kfree(sdev);
 }
 
-// Callback to free a snapshot device and its session within async RCU
-// context
+/* Callback to free a snapshot device and its session. Used within `call_rcu`
+ * function. */
 static inline void free_sdev_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
@@ -457,9 +461,9 @@ static inline void free_sdev_callback(struct rcu_head *rcu) {
       free_sdev(sdev);
 }
 
-// Computes a function on a snapshot device. It looks up the device by its
-// `dev_t` identifier and calls the function following RCU based
-// "locking".
+/* Computes a function on a snapshot device. It looks up the device by its
+`dev_t` identifier and calls the function following RCU based
+"locking". */
 static inline int rcu_compute_on_sdev(dev_t dev, void *arg,
                                       int (*compute_f)(snap_device *, void *)) {
       int ret;
@@ -657,12 +661,9 @@ static struct snap_session_container *
 create_snap_container(struct dentry *session_dentry, int cpu, bool is_owner) {
       struct snap_session_container *container = NULL;
       char container_fname[16];
-      struct dentry *container_dentry;
-      struct file *filp;
-      struct path container_path;
+      struct dentry *container_dentry = NULL;
+      struct file *filp = NULL;
       int ret;
-      // TODO: check this
-      umode_t mode = S_IFREG | 0644;
 
       snprintf(container_fname, sizeof(container_fname), "snap_c%d", cpu);
 
@@ -670,40 +671,44 @@ create_snap_container(struct dentry *session_dentry, int cpu, bool is_owner) {
       if (!container_dentry)
             return ERR_PTR(-ENOMEM);
 
-      // Create the file
       ret =
           vfs_create(snapshot_root_path.mnt->mnt_idmap, d_inode(session_dentry),
-                     container_dentry, mode, true); // TODO: check true meaning
-      if (ret) {
-            dput(container_dentry);
-            return ERR_PTR(ret);
-      }
+                     container_dentry, S_IFREG | 0660, true);
+      if (ret)
+            goto out_err;
+
       struct path child_path = {
           .mnt = snapshot_root_path.mnt,
           .dentry = container_dentry,
       };
+
       filp = dentry_open(&child_path, O_WRONLY | O_APPEND, current_cred());
       if (IS_ERR(filp)) {
-            dput(container_dentry);
-            return ERR_CAST(filp);
+            ret = PTR_ERR(filp);
+            filp = NULL;
+            goto out_err;
       }
 
       container = alloc_session_container(session_dentry, filp);
       if (!container) {
-            filp_close(filp, NULL);
-            dput(container_dentry);
-            return ERR_PTR(-ENOMEM);
+            ret = -ENOMEM;
+            goto out_err;
       }
+
       dput(container_dentry);
 
-      if (!is_owner) {
-            // Acquire a reference to the sessiomn dentry, since this CPU is not
-            // the owner. The owner CPU already holds a reference from when it
-            // created the directory associated to the dentry. Each CPU will
-            // release its reference at the end of the session.
+      if (!is_owner)
+            // Take extra ref for non-owner CPUs
             dget(session_dentry);
-      }
+
       return container;
+
+out_err:
+      if (filp)
+            filp_close(filp, NULL);
+      if (container_dentry)
+            dput(container_dentry);
+      return ERR_PTR(ret);
 }
 
 static int make_snapshot(const char *session_name, struct file *container_file,
@@ -746,8 +751,15 @@ static int process_block(blog_work *bwork) {
       struct snap_session_container *container;
       int ret;
 
+      int cpu = smp_processor_id();
+
       dev = bwork->inode->i_sb->s_bdev->bd_dev;
       session_dentry = bwork->session_dentry;
+
+      AUDIT log_info(
+          "Processing block log work on CPU %d. Device: %d, Block: %d\n", cpu,
+          dev, bwork->block);
+
       if (!session_dentry) {
             struct session_dentry_metadata session_meta = {
                 .dentry = NULL,
@@ -782,15 +794,18 @@ static int process_block(blog_work *bwork) {
             }
       }
 
-      int cpu = smp_processor_id();
       container =
           create_snap_container(session_dentry, cpu, is_cpu_dentry_owner);
+
       if (IS_ERR(container)) {
             ret = PTR_ERR(container);
             return ret;
       }
 
       hlist_add_head(&container->hnode, &containers[hash]);
+
+      log_info("Created new session container on CPU %d. Session: %s\n", cpu,
+               container->session_dentry->d_name.name);
 
 make_snapshot:
 
@@ -802,10 +817,13 @@ make_snapshot:
             return ret;
       }
 
+      log_info("Snapshot done. CPU: %d, Session: %s, Block: %d", cpu,
+               session_dentry->d_name.name, bwork->block);
+
       return 0;
 }
 
-// Worker function that processes a block log work
+/* Worker function that processes a block log work */
 static void process_block_log(struct work_struct *work) {
 
       blog_work *bwork = container_of(work, struct block_log_work, work);
@@ -813,6 +831,9 @@ static void process_block_log(struct work_struct *work) {
 
       ret = process_block(bwork);
       if (ret == RESCHED) {
+            log_info("Rescheduling work. Device: %d, Block: %d\n",
+                     bwork->inode->i_sb->s_bdev->bd_dev, bwork->block);
+
             queue_work(block_log_wq, &bwork->work);
       }
 
@@ -928,9 +949,9 @@ static struct kretprobe rp_mount = {
     .handler = mount_bdev_ret_handler,
 };
 
-// Function to clear the snapshot session on unmount. For loop devices it will
-// free the whole loop device. It is used as a callback for the
-// `rcu_compute_on_sdev` function.
+/* Function to clear the snapshot session on umount. For loop devices it will
+free the whole `snap_device` and unmap the device-file. It is used as a callback
+for the `rcu_compute_on_sdev` function. */
 static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
       snap_device *old_sdev, *new_sdev;
       int ret;
@@ -990,10 +1011,8 @@ static int umount_entry_handler(struct kretprobe_instance *ri,
           (struct umount_kretprobe_metadata *)ri->data;
       struct super_block *sb = NULL;
 
-#if defined(CONFIG_X86_64)
+#ifdef CONFIG_X86_64
       sb = (struct super_block *)regs->di;
-#elif defined(CONFIG_ARM64)
-      sb = (struct super_block *)regs->regs[0];
 #else
 #error "Architecture not supported"
 #endif
@@ -1032,12 +1051,12 @@ struct write_metadata {
       sector_t out_block;
 };
 
-// Callback function used to acquire the block number that will eventually be
-// overwritten. It adds the block number to the session
-// `reading_blocks` in order for the `sb_read` kretprobe to now which block to
-// copy. It adds the block also to the session `committed_blocks` to know which
-// subsequent write will not be captured because the block was already copied.
-// NOTE: As of now we support a single block write at a time.
+/* Callback function used to acquire the block number that will eventually be
+overwritten. It adds the block number to the session
+`reading_blocks` in order for the `sb_read` kretprobe to know which block to
+copy. It adds the block also to the session `committed_blocks` to know which
+subsequent write will not be captured because the block was already copied.
+NOTE: As of now we support a single block write at a time. */
 static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       snapshot_session *session;
       struct snap_block *snap_block;
@@ -1085,6 +1104,11 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
 
       hlist_add_head(&snap_block->cb_hnode, &session->committed_blocks[b_hash]);
       spin_unlock(&session->cb_locks[b_hash]);
+
+      AUDIT log_info(
+          "record_block_on_write_callback: Snapshot device : %s; Block %d "
+          "committed\n",
+          sdev_name(sdev), snap_block->block);
 
       // Add the block to the reading blocks
       spin_lock(&session->rb_locks[b_hash]);
@@ -1143,9 +1167,9 @@ static int pre_write_handler(struct file *file, loff_t offset, size_t count,
       return ret;
 }
 
-// Callback that rollbacks the block commitment performed during a write
-// operation pre handler. It deletes an entry for both the `committed_blocks`
-// and the `reading blocks` lists. Finally, it frees the deleted node.
+/* Callback that rollbacks the block commitment performed during a write
+operation pre handler. It deletes an entry for both the `committed_blocks`
+and the `reading blocks` lists. Finally, it frees the deleted node. */
 static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
       sector_t block;
       snapshot_session *session;
@@ -1220,6 +1244,9 @@ static int vfs_write_ret_handler(struct kretprobe_instance *ri,
       meta = (struct write_kretprobe_metadata *)ri->data;
 
       if (ret < 0) {
+            AUDIT log_info("vfs_write_ret_handler: Error writing to block "
+                           "device %d. Rolling back committed block..\n",
+                           meta->dev);
             // An error occured: we must "rollback" what the pre_handler did
             rcu_compute_on_sdev(meta->dev, (void *)&meta->block,
                                 rollback_write_entry_callback);
@@ -1242,9 +1269,9 @@ struct sb_read_kretprobe_metadata {
       struct dentry *session_dentry;
 };
 
-// Callback to check if a read block matches the one in `arg`. If so, the caller
-// receives the inode of the file whose write triggered the block read and the
-// snapshot path, both needed for deferred work.
+/* Callback to check if a read block matches the one in `arg`. If so, the caller
+receives the inode of the file whose write triggered the block read and the
+snapshot dentry, both needed for deferred work. */
 static int try_read_block_callback(snap_device *sdev, void *arg) {
       struct sb_read_kretprobe_metadata *meta;
       snapshot_session *session;
@@ -1266,6 +1293,9 @@ static int try_read_block_callback(snap_device *sdev, void *arg) {
       struct snap_block *sb;
       hlist_for_each_entry(sb, &session->reading_blocks[b_hash], rb_hnode) {
             if (sb->block == meta->block) {
+                  AUDIT log_info("try_read_block_callback: Found reading block "
+                                 "%d for device %s\n",
+                                 sb->block, sdev_name(sdev));
                   hlist_del(&sb->rb_hnode);
                   spin_unlock(&session->rb_locks[b_hash]);
 
@@ -1354,6 +1384,9 @@ static int sb_read_ret_handler(struct kretprobe_instance *ri,
                   goto out;
             }
             memcpy(bdata, bh->b_data, bh->b_size);
+            AUDIT log_info(
+                "sb_read_ret_handler: Copied block %d from device %d\n",
+                meta->block, meta->inode->i_sb->s_bdev);
 
             // Enqueue the block log work
             bwork = kmalloc(sizeof(blog_work), GFP_ATOMIC);
@@ -1371,6 +1404,10 @@ static int sb_read_ret_handler(struct kretprobe_instance *ri,
             bwork->inode = meta->inode;
 
             queue_work(block_log_wq, &bwork->work);
+
+            AUDIT log_info("sb_read_ret_handler: Snapshot work queued "
+                           "succesfully for device %d\n",
+                           meta->inode->i_sb->s_bdev);
       }
 
 out:
@@ -1384,7 +1421,8 @@ static struct kretprobe rp_sb_read = {
     .data_size = sizeof(struct sb_read_kretprobe_metadata),
 };
 
-static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write};
+static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write,
+                                        &rp_sb_read};
 
 int register_my_kretprobes(void) {
       int i, ret;
