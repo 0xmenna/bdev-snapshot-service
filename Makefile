@@ -58,7 +58,7 @@ endef
 
 # -----------------------------------------------------------
 
-all: build_usctm build_bdev_snapshot build_testing_fs
+all: build_bdev_snapshot build_testing_fs build_usctm
 
 clean:
 	$(call clean_module,.)

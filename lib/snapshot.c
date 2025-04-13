@@ -279,7 +279,7 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
       struct dentry *session_dentry = NULL;
       int ret;
 
-      DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
+      AUDIT DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
 
       struct session_dentry_metadata *session_meta = arg;
 
@@ -356,7 +356,7 @@ static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
             return -NOSDEV;
       }
 
-      DEBUG_ASSERT(!sdev->session);
+      AUDIT DEBUG_ASSERT(!sdev->session);
 
       session = kmalloc(sizeof(snapshot_session), GFP_ATOMIC);
       if (!session) {
@@ -405,6 +405,8 @@ static void free_percpu_session_container(void *info) {
                   dput(entry->session_dentry);
 
                   kfree(entry);
+
+                  return;
             }
       }
 }
@@ -429,7 +431,7 @@ static void free_sdev(snap_device *sdev) {
             if (session->snap_dentry) {
                   // Ensure async execution
                   on_each_cpu(free_percpu_session_container,
-                              session->snap_dentry, 0);
+                              (void *)session->snap_dentry, 0);
             }
 
             kfree(session);
@@ -835,6 +837,8 @@ static void process_block_log(struct work_struct *work) {
                      bwork->inode->i_sb->s_bdev->bd_dev, bwork->block);
 
             queue_work(block_log_wq, &bwork->work);
+
+            return;
       }
 
       // Final end of inode chain at step 4.
@@ -1055,7 +1059,7 @@ struct write_metadata {
 
 /* Callback function used to acquire the block number that will eventually be
 overwritten. It adds the block number to the session
-`reading_blocks` in order for the `sb_read` kretprobe to know which block to
+`reading_blocks` in order for the `sb_bread` kretprobe to know which block to
 copy. It adds the block also to the session `committed_blocks` to know which
 subsequent write will not be captured because the block was already copied.
 NOTE: As of now we support a single block write at a time. */
@@ -1179,7 +1183,7 @@ static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
       sector_t block;
       snapshot_session *session;
 
-      DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
+      AUDIT DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
 
       session = sdev->session;
       block = *((sector_t *)arg);
@@ -1200,7 +1204,7 @@ static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
                   break;
             }
       }
-      DEBUG_ASSERT(found);
+      AUDIT DEBUG_ASSERT(found);
 
       // Remove the block from the reading blocks
       spin_lock(&session->rb_locks[b_hash]);
@@ -1250,14 +1254,21 @@ static int vfs_write_ret_handler(struct kretprobe_instance *ri,
       ssize_t ret;
       struct write_kretprobe_metadata *meta;
 
-      ret = *((ssize_t *)regs_return_value(regs));
+#if defined(CONFIG_X86_64)
+      ret = (ssize_t)regs->ax;
+#elif defined(CONFIG_ARM64)
+      ret = (ssize_t)regs->regs[0];
+#else
+#error "Unsupported architecture"
+#endif
+
       meta = (struct write_kretprobe_metadata *)ri->data;
 
       if (ret < 0) {
             AUDIT log_info("vfs_write_ret_handler: Error writing to block "
                            "device %d. Rolling back committed block..\n",
                            meta->dev);
-            // An error occured: we must "rollback" what the pre_handler did
+            // An error occurred: we must "rollback" what the pre_handler did
             rcu_compute_on_sdev(meta->dev, (void *)&meta->block,
                                 rollback_write_entry_callback);
       }
@@ -1272,7 +1283,7 @@ static struct kretprobe rp_vfs_write = {
     .data_size = sizeof(struct write_kretprobe_metadata),
 };
 
-struct sb_read_kretprobe_metadata {
+struct sb_bread_kretprobe_metadata {
       sector_t block;
 
       struct inode *inode;
@@ -1283,7 +1294,7 @@ struct sb_read_kretprobe_metadata {
 receives the inode of the file whose write triggered the block read and the
 snapshot dentry, both needed for deferred work. */
 static int try_read_block_callback(snap_device *sdev, void *arg) {
-      struct sb_read_kretprobe_metadata *meta;
+      struct sb_bread_kretprobe_metadata *meta;
       snapshot_session *session;
 
       if (!sdev) {
@@ -1293,7 +1304,7 @@ static int try_read_block_callback(snap_device *sdev, void *arg) {
             return -SDEVNOTACTIVE;
       }
       session = sdev->session;
-      meta = (struct sb_read_kretprobe_metadata *)arg;
+      meta = (struct sb_bread_kretprobe_metadata *)arg;
 
       u32 b_hash = hash_block(meta->block);
 
@@ -1332,39 +1343,35 @@ static int try_read_block_callback(snap_device *sdev, void *arg) {
       return -NO_RBLOCK;
 }
 
-static int sb_read_entry_handler(struct kretprobe_instance *ri,
-                                 struct pt_regs *regs) {
+static int sb_bread_entry_handler(struct kretprobe_instance *ri,
+                                  struct pt_regs *regs) {
 
-      struct super_block *sb;
+      struct block_device *bdev;
       sector_t block;
-      unsigned long size;
       gfp_t gfp;
-      struct sb_read_kretprobe_metadata *meta;
+      struct sb_bread_kretprobe_metadata *meta;
       dev_t dev;
       int ret;
 
 #if defined(CONFIG_X86_64)
-      sb = (struct super_block *)regs->di;
+      bdev = (struct block_device *)regs->di;
       block = (sector_t)regs->si;
-      size = (unsigned long)regs->dx;
       gfp = (gfp_t)regs->cx;
 #elif defined(CONFIG_ARM64)
-      sb = (struct super_block *)regs->regs[0];
+      bdev = (struct block_device *)regs->regs[0];
       block = (sector_t)regs->regs[1];
-      size = (unsigned long)regs->regs[2];
       gfp = (gfp_t)regs->regs[3];
 #else
 #error "Unsupported architecture"
 #endif
 
-      meta = (struct sb_read_kretprobe_metadata *)ri->data;
+      meta = (struct sb_bread_kretprobe_metadata *)ri->data;
 
-      if (IS_ERR(sb) || !sb->s_bdev || size != sb->s_blocksize ||
-          gfp != __GFP_MOVABLE) {
+      if (!bdev || gfp != __GFP_MOVABLE) {
             return -1;
       }
 
-      dev = sb->s_bdev->bd_dev;
+      dev = bdev->bd_dev;
 
       // Check whether to read the block or not.
       // If the block must be read, then consume the node from the session
@@ -1377,7 +1384,7 @@ static int sb_read_entry_handler(struct kretprobe_instance *ri,
             return -1;
       }
 
-      DEBUG_ASSERT(dev == meta->inode->i_sb->s_bdev->bd_dev);
+      AUDIT DEBUG_ASSERT(dev == meta->inode->i_sb->s_bdev->bd_dev);
 
       // Execute the return handler: copy the read block and defer VFS-related
       // work.
@@ -1385,16 +1392,23 @@ static int sb_read_entry_handler(struct kretprobe_instance *ri,
 }
 
 // If this is executed, than we must copy the block and defer vfs related work
-static int sb_read_ret_handler(struct kretprobe_instance *ri,
-                               struct pt_regs *regs) {
+static int sb_bread_ret_handler(struct kretprobe_instance *ri,
+                                struct pt_regs *regs) {
       struct buffer_head *bh;
-      struct sb_read_kretprobe_metadata *meta;
+      struct sb_bread_kretprobe_metadata *meta;
       // Log entry used to enqueue the copied block (used in deferred working).
       blog_work *bwork;
       char *bdata;
 
-      bh = (struct buffer_head *)regs_return_value(regs);
-      meta = (struct sb_read_kretprobe_metadata *)ri->data;
+#if defined(CONFIG_X86_64)
+      bh = (struct buffer_head *)regs->ax;
+#elif defined(CONFIG_ARM64)
+      bh = (struct buffer_head *)regs->regs[0];
+#else
+#error "Unsupported architecture"
+#endif
+
+      meta = (struct sb_bread_kretprobe_metadata *)ri->data;
 
       if (!IS_ERR(bh)) {
             // Copy the block
@@ -1406,8 +1420,8 @@ static int sb_read_ret_handler(struct kretprobe_instance *ri,
             }
             memcpy(bdata, bh->b_data, bh->b_size);
             AUDIT log_info(
-                "sb_read_ret_handler: Copied block %d from device %d\n",
-                meta->block, meta->inode->i_sb->s_bdev);
+                "sb_bread_ret_handler: Copied block %d from device %d\n",
+                meta->block, meta->inode->i_sb->s_bdev->bd_dev);
 
             // Enqueue the block log work
             bwork = kmalloc(sizeof(blog_work), GFP_ATOMIC);
@@ -1427,25 +1441,25 @@ static int sb_read_ret_handler(struct kretprobe_instance *ri,
 
             queue_work(block_log_wq, &bwork->work);
 
-            AUDIT log_info("sb_read_ret_handler: Snapshot work queued "
+            AUDIT log_info("sb_bread_ret_handler: Snapshot work queued "
                            "succesfully for device %d\n",
-                           meta->inode->i_sb->s_bdev);
+                           meta->inode->i_sb->s_bdev->bd_dev);
       }
 
 out:
       return 0;
 }
 
-static struct kretprobe rp_sb_read = {
+static struct kretprobe rp_sb_bread = {
     .kp.symbol_name =
         "__bread_gfp", // we can't probe sb_bread beacuse is an inline function
-    .entry_handler = sb_read_entry_handler,
-    .handler = sb_read_ret_handler,
-    .data_size = sizeof(struct sb_read_kretprobe_metadata),
+    .entry_handler = sb_bread_entry_handler,
+    .handler = sb_bread_ret_handler,
+    .data_size = sizeof(struct sb_bread_kretprobe_metadata),
 };
 
 static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write,
-                                        &rp_sb_read};
+                                        &rp_sb_bread};
 
 int register_my_kretprobes(void) {
       int i, ret;
