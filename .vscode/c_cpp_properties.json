@@ -6,19 +6,18 @@
                   "compilerPath": "/usr/bin/gcc",
                   "cStandard": "c17",
                   "cppStandard": "gnu++17",
-                  "intelliSenseMode": "linux-gcc-x64",
                   "includePath": [
                         "${workspaceFolder}/**",
-                        "/usr/src/linux-headers-6.8.0-57-generic/arch/x86/include",
-                        "/usr/src/linux-headers-6.8.0-57-generic/arch/x86/include/generated",
-                        "/usr/src/linux-headers-6.8.0-57-generic/include",
-                        "/usr/src/linux-headers-6.8.0-57-generic/include/linux",
-                        "/usr/src/linux-headers-6.8.0-57-generic/arch/x86/include/uapi",
-                        "/usr/src/linux-headers-6.8.0-57-generic/arch/x86/include/generated/uapi",
-                        "/usr/src/linux-headers-6.8.0-57-generic/include/uapi",
-                        "/usr/src/linux-headers-6.8.0-57-generic/include/generated/uapi",
-                        "/usr/src/linux-headers-6.8.0-57-generic/ubuntu/include",
-                        "/usr/lib/gcc/x86_64-linux-gnu/13/include"
+                        "/usr/src/linux-headers-6.14.0-15-generic/arch/x86/include",
+                        "/usr/src/linux-headers-6.14.0-15-generic/arch/arm64/include/generated",
+                        "/usr/src/linux-headers-6.14.0-15-generic/include",
+                        "/usr/src/linux-headers-6.14.0-15-generic/include/linux",
+                        "/usr/src/linux-headers-6.14.0-15-generic/arch/x86/include/uapi",
+                        "/usr/src/linux-headers-6.14.0-15-generic/arch/arm64/include/generated/uapi",
+                        "/usr/src/linux-headers-6.14.0-15-generic/include/uapi",
+                        "/usr/src/linux-headers-6.14.0-15-generic/include/generated/uapi",
+                        "/usr/src/linux-headers-6.14.0-15-generic/ubuntu/include",
+                        "/usr/lib/gcc/aarch64-linux-gnu/14/include"
                   ]
             }
       ],

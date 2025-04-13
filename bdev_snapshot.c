@@ -26,12 +26,10 @@
 
 // Module parameters
 
-#ifdef CONFIG_X86
 // If no syscall support is needed just leave the syscall table address to 0x0
 unsigned long the_syscall_table = 0x0;
 module_param(the_syscall_table, ulong, 0660);
 MODULE_PARM_DESC(the_syscall_table, "The syscall table address");
-#endif
 
 static bool snapshot_ioctl = false;
 module_param(snapshot_ioctl, bool, 0660);

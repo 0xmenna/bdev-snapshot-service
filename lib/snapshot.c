@@ -729,14 +729,14 @@ static int make_snapshot(const char *session_name, struct file *container_file,
       pos = container_file->f_pos;
 
       // Write the header record
-      written = kernel_write(container_file, &header, sizeof(header), pos);
+      written = kernel_write(container_file, &header, sizeof(header), &pos);
       if (written != sizeof(header)) {
             return -EIO;
       }
       pos += written;
 
       // Write the block data
-      written = kernel_write(container_file, bdata, data_size, pos);
+      written = kernel_write(container_file, bdata, data_size, &pos);
       if (written != data_size) {
             return -EIO;
       }
@@ -1011,8 +1011,10 @@ static int umount_entry_handler(struct kretprobe_instance *ri,
           (struct umount_kretprobe_metadata *)ri->data;
       struct super_block *sb = NULL;
 
-#ifdef CONFIG_X86_64
+#if defined(CONFIG_X86_64)
       sb = (struct super_block *)regs->di;
+#elif defined(CONFIG_ARM64)
+      sb = (struct super_block *)regs->regs[0];
 #else
 #error "Architecture not supported"
 #endif
@@ -1127,13 +1129,16 @@ struct write_kretprobe_metadata {
       sector_t block;
 };
 
-static int pre_write_handler(struct file *file, loff_t offset, size_t count,
+static int pre_write_handler(struct file *file, loff_t *off, size_t count,
                              struct write_kretprobe_metadata *out_meta) {
       struct write_metadata wm;
+      loff_t offset;
       int ret;
 
-      if (!file || !file->f_inode)
+      if (!file || !file->f_inode || !off)
             return -EINVAL;
+
+      offset = *off;
 
       // This inode will traverse a chain. If it passes through all steps, it
       // will be released at the end of the deferred working process. If one of
@@ -1213,15 +1218,23 @@ static int vfs_write_entry_handler(struct kretprobe_instance *ri,
                                    struct pt_regs *regs) {
       struct file *file;
       size_t count;
-      loff_t offset;
+      loff_t *offset;
       int ret;
-#ifdef CONFIG_X86_64
-      file = (struct file *)regs->di;
-      count = (size_t)regs->dx;
-      offset = (loff_t *)regs->cx;
 
       struct write_kretprobe_metadata *meta =
           (struct write_kretprobe_metadata *)ri->data;
+
+#if defined(CONFIG_X86_64)
+      file = (struct file *)regs->di;
+      count = (size_t)regs->dx;
+      offset = (loff_t *)regs->cx;
+#elif defined(CONFIG_ARM64)
+      file = (struct file *)regs->regs[0];
+      count = (size_t)regs->regs[2];
+      offset = (loff_t *)regs->regs[3];
+#else
+#error "Unsupported architecture"
+#endif
 
       ret = pre_write_handler(file, offset, count, meta);
       if (ret) {
@@ -1230,9 +1243,6 @@ static int vfs_write_entry_handler(struct kretprobe_instance *ri,
       }
 
       return 0;
-#else
-#error "Unsupported architecture"
-#endif
 }
 
 static int vfs_write_ret_handler(struct kretprobe_instance *ri,
@@ -1331,17 +1341,25 @@ static int sb_read_entry_handler(struct kretprobe_instance *ri,
       dev_t dev;
       int ret;
 
-#ifdef CONFIG_X86_64
+#if defined(CONFIG_X86_64)
       sb = (struct super_block *)regs->di;
-      block = (sector_t)regs->dx;
+      block = (sector_t)regs->si;
+#elif defined(CONFIG_ARM64)
+      sb = (struct super_block *)regs->regs[0];
+      block = (sector_t)regs->regs[1];
+#else
+#error "Unsupported architecture"
+#endif
+
       meta = (struct sb_read_kretprobe_metadata *)ri->data;
 
-      if (!sb->s_bdev) {
+      if (!sb || !sb->s_bdev) {
             return -1;
       }
+
       dev = sb->s_bdev->bd_dev;
 
-      // Check wheter to read the block or not.
+      // Check whether to read the block or not.
       // If the block must be read, then consume the node from the session
       // reading block list
       meta->block = block;
@@ -1356,11 +1374,7 @@ static int sb_read_entry_handler(struct kretprobe_instance *ri,
 
       // Execute the return handler: copy the read block and defer VFS-related
       // work.
-
       return 0;
-#else
-#error "Unsupported architecture"
-#endif
 }
 
 // If this is executed, than we must copy the block and defer vfs related work
@@ -1421,8 +1435,7 @@ static struct kretprobe rp_sb_read = {
     .data_size = sizeof(struct sb_read_kretprobe_metadata),
 };
 
-static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write,
-                                        &rp_sb_read};
+static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write};
 
 int register_my_kretprobes(void) {
       int i, ret;
