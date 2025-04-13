@@ -1336,24 +1336,31 @@ static int sb_read_entry_handler(struct kretprobe_instance *ri,
                                  struct pt_regs *regs) {
 
       struct super_block *sb;
-      struct sb_read_kretprobe_metadata *meta;
       sector_t block;
+      unsigned long size;
+      gfp_t gfp;
+      struct sb_read_kretprobe_metadata *meta;
       dev_t dev;
       int ret;
 
 #if defined(CONFIG_X86_64)
       sb = (struct super_block *)regs->di;
       block = (sector_t)regs->si;
+      size = (unsigned long)regs->dx;
+      gfp = (gfp_t)regs->cx;
 #elif defined(CONFIG_ARM64)
       sb = (struct super_block *)regs->regs[0];
       block = (sector_t)regs->regs[1];
+      size = (unsigned long)regs->regs[2];
+      gfp = (gfp_t)regs->regs[3];
 #else
 #error "Unsupported architecture"
 #endif
 
       meta = (struct sb_read_kretprobe_metadata *)ri->data;
 
-      if (!sb || !sb->s_bdev) {
+      if (IS_ERR(sb) || !sb->s_bdev || size != sb->s_blocksize ||
+          gfp != __GFP_MOVABLE) {
             return -1;
       }
 
@@ -1430,7 +1437,8 @@ out:
 }
 
 static struct kretprobe rp_sb_read = {
-    .kp.symbol_name = "sb_bread",
+    .kp.symbol_name =
+        "__bread_gfp", // we can't probe sb_bread beacuse is an inline function
     .entry_handler = sb_read_entry_handler,
     .handler = sb_read_ret_handler,
     .data_size = sizeof(struct sb_read_kretprobe_metadata),
