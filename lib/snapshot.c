@@ -1412,6 +1412,7 @@ static int sb_read_ret_handler(struct kretprobe_instance *ri,
             }
             INIT_BLOG_WORK(bwork, meta->session_dentry, meta->block, bdata,
                            bh->b_size, process_block_log);
+
             // inode chain step 4.
             // It will be the responsibility of the deferred worker to release
             // it.
