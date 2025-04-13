@@ -1435,7 +1435,8 @@ static struct kretprobe rp_sb_read = {
     .data_size = sizeof(struct sb_read_kretprobe_metadata),
 };
 
-static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write};
+static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write,
+                                        &rp_sb_read};
 
 int register_my_kretprobes(void) {
       int i, ret;
