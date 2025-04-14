@@ -31,7 +31,7 @@ unsigned long the_syscall_table = 0x0;
 module_param(the_syscall_table, ulong, 0660);
 MODULE_PARM_DESC(the_syscall_table, "The syscall table address");
 
-static bool snapshot_ioctl = false;
+static bool snapshot_ioctl = true;
 module_param(snapshot_ioctl, bool, 0660);
 MODULE_PARM_DESC(
     snapshot_ioctl,

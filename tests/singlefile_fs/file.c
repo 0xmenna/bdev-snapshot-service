@@ -215,6 +215,8 @@ struct dentry *onefilefs_lookup(struct inode *parent_inode,
                                 S_IWUSR | S_IWGRP | S_IXUSR | S_IXGRP | S_IXOTH;
             the_inode->i_fop = &onefilefs_file_operations;
             the_inode->i_op = &onefilefs_inode_ops;
+            // extension for bmap
+            the_inode->i_mapping->a_ops = &singlefilefs_aops;
 
             // just one link for this file
             set_nlink(the_inode, 1);
@@ -258,4 +260,18 @@ const struct file_operations onefilefs_file_operations = {
     .write = onefilefs_write,
     //.write = onefilefs_write //please implement this function to complete the
     // exercise
+};
+
+// SinglefileFS extension: bmap function that allows mapping logical block
+// numbers to physical block numbers on the device.
+static sector_t singlefilefs_bmap(struct address_space *mapping,
+                                  sector_t block) {
+      // Given that block is given by offset / blocksize, to get the physical
+      // block we simply add 2 (the value 2 accounts for superblock and
+      // file-inode on device)
+      return block + 2;
+}
+
+const struct address_space_operations singlefilefs_aops = {
+    .bmap = singlefilefs_bmap,
 };

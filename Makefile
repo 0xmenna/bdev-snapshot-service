@@ -58,7 +58,9 @@ endef
 
 # -----------------------------------------------------------
 
-all: build_bdev_snapshot build_testing_fs build_usctm
+test: build_bdev_snapshot build_testing_fs load_bdev_snapshot_ioctl load_testing_fs_driver create_testing_fs
+
+all: build_usctm build_bdev_snapshot build_testing_fs
 
 clean:
 	$(call clean_module,.)
@@ -67,13 +69,9 @@ clean:
 	rm -rf usctm
 	rm tests/singlefile_fs/singlefilemakefs
 
-load_X86: load_usctm load_bdev_snapshot_all load_testing_fs_driver
+load: load_usctm load_bdev_snapshot_all load_testing_fs_driver
 
-unload_X86: unload_testing_fs_driver unload_bdev_snapshot unload_usctm
-
-load: load_bdev_snapshot_ioctl load_testing_fs_driver
-
-unload: unload_testing_fs_driver unload_bdev_snapshot
+unload: unload_testing_fs_driver unload_bdev_snapshot unload_usctm
 
 clone_usctm:
 	@if [ ! -d "usctm" ]; then \

@@ -46,7 +46,7 @@ int copy_params_from_user(const char __user *dev_name,
 
 // Get the physical block number on the device based on the offset and the inode
 // of a given file
-sector_t get_block(struct inode *inode, loff_t offset);
+inline int get_block(struct inode *inode, loff_t offset, sector_t *block);
 
 void path_to_safe_name(const char *pathname, char *out_pathname, size_t len);
 

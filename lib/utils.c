@@ -1,4 +1,6 @@
 #include "../include/utils.h"
+#include <linux/buffer_head.h>
+#include <linux/fs.h>
 
 #define AUDIT if (1)
 
@@ -56,18 +58,17 @@ int copy_params_from_user(const char __user *dev_name,
       return 0;
 }
 
-#define DEFAULT_BLOCK_SIZE 4096
-
-// As of now we support the singlefilefs, therefore we know that a
-// physical block is given by: [ (offset / blocksize) + 2 ]
-// It would be nice to support all file systems that use the bmap function
+// All file systems that implement the bmap function are supported
 // (https://elixir.bootlin.com/linux/v6.8/source/fs/inode.c#L1771)
-sector_t get_block(struct inode *inode, loff_t offset) {
-      sector_t block = offset / DEFAULT_BLOCK_SIZE + 2;
+inline int get_block(struct inode *inode, loff_t offset, sector_t *block) {
+      if (!inode->i_mapping->a_ops->bmap) {
+            AUDIT log_err("File system does not implement bmap\n");
+            return -EINVAL;
+      }
+      *block = offset / inode->i_sb->s_blocksize;
+      *block = inode->i_mapping->a_ops->bmap(inode->i_mapping, *block);
 
-      // sector_t block = (offset >> inode->i_blkbits) + 2;
-
-      return block;
+      return 0;
 }
 
 void path_to_safe_name(const char *pathname, char *out_pathname, size_t len) {

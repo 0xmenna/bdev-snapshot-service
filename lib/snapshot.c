@@ -17,7 +17,7 @@ static DEFINE_PER_CPU(struct hlist_head[1 << DEFAULT_HASH_BITS],
 /* Workqueue for block log processing */
 static struct workqueue_struct *block_log_wq;
 
-void init_devices(void) { INIT_LIST_HEAD(&devices.fdevices); }
+inline void init_devices(void) { INIT_LIST_HEAD(&devices.fdevices); }
 
 int init_snapshot_path(void) {
       int error;
@@ -184,7 +184,7 @@ static inline void put_fdev_callback(struct rcu_head *rcu) {
 
 /* Computes a function on a device-file. It looks up the device (via its dentry)
 and calls the compute function on the found device (it follows RCU based
-"locking"). */
+syncronization). */
 static int rcu_compute_on_filedev(struct dentry *lookup_dentry, void *arg,
                                   int (*compute_f)(file_dev_t *, void *)) {
 
@@ -441,7 +441,7 @@ static void free_sdev(snap_device *sdev) {
 }
 
 /* Callback to free a snapshot device without its session. Used within
- * `call_rcu` function. */
+`call_rcu` function. */
 static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
@@ -453,7 +453,7 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
 }
 
 /* Callback to free a snapshot device and its session. Used within `call_rcu`
- * function. */
+function. */
 static inline void free_sdev_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
@@ -465,7 +465,7 @@ static inline void free_sdev_callback(struct rcu_head *rcu) {
 
 /* Computes a function on a snapshot device. It looks up the device by its
 `dev_t` identifier and calls the function following RCU based
-"locking". */
+syncronization. */
 static inline int rcu_compute_on_sdev(dev_t dev, void *arg,
                                       int (*compute_f)(snap_device *, void *)) {
       int ret;
@@ -1079,7 +1079,11 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       session = sdev->session;
       wm = (struct write_metadata *)arg;
 
-      block = get_block(wm->inode, wm->offset);
+      int ret = get_block(wm->inode, wm->offset, &block);
+      if (ret) {
+            return ret;
+      }
+
       wm->out_block = block;
 
       snap_block = kmalloc(sizeof(struct snap_block), GFP_ATOMIC);

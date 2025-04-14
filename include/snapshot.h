@@ -331,7 +331,7 @@ void unregister_my_kretprobes(void);
 int init_snapshot_path(void);
 void put_snapshot_path(void);
 
-void init_devices(void);
+inline void init_devices(void);
 
 int init_work_queue(int max_active);
 void cleanup_work_queue(void);
