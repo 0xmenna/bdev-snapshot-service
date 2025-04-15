@@ -5,7 +5,9 @@
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/cdev.h>
+#include <linux/crypto.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/hashtable.h>
@@ -67,8 +69,8 @@
 #define S_BLOCKS_HASH_BITS 12
 #define DEFAULT_HASH_BITS 8
 
-/* Magic identifier used in snapshot block records ('SNAP') */
-#define SNAPSHOT_RECORD_MAGIC 0x534E4150
+/* Magic identifier used in session container files ('SNAP') */
+#define SNAPSHOT_SESSION_MAGIC 0x50414E53
 
 /**
  * struct snapshot_devices - Registry for snapshot devices
@@ -189,11 +191,13 @@ static inline struct dentry *d_session(snapshot_session *session) {
 /**
  * struct snap_session_container - Container for session resources
  * @session_dentry:    Dentry identifying the session
+ * @comp:             Compression algorithm
  * @file:              Open file for writing the block log
  * @hnode:             Hash node for lookup
  */
 struct snap_session_container {
       struct dentry *session_dentry;
+      struct crypto_comp *comp;
       struct file *file;
       struct hlist_node hnode;
 };
@@ -201,11 +205,23 @@ struct snap_session_container {
 static inline struct snap_session_container *
 alloc_session_container(struct dentry *dentry, struct file *file) {
       struct snap_session_container *c;
+      struct crypto_comp *comp;
+
       c = kmalloc(sizeof(struct snap_session_container), GFP_KERNEL);
       if (!c) {
             return NULL;
       }
+      comp = crypto_alloc_comp("zlib-deflate", 0, 0);
+      if (IS_ERR(comp)) {
+            AUDIT log_err("Failed to allocate compressor: %ld\n",
+                          PTR_ERR(comp));
+
+            kfree(c);
+            return NULL;
+      }
+
       c->session_dentry = dentry;
+      c->comp = comp;
       c->file = file;
       INIT_HLIST_NODE(&c->hnode);
       return c;
@@ -217,6 +233,9 @@ static inline void free_container(struct snap_session_container *container) {
       }
       if (container->session_dentry) {
             dput(container->session_dentry);
+      }
+      if (container->comp) {
+            crypto_free_comp(container->comp);
       }
       kfree(container);
 }
@@ -311,17 +330,19 @@ static inline void free_blog_work(blog_work *bwork) {
       kfree(bwork);
 }
 
+typedef struct session_header {
+      u32 magic;
+      size_t block_size;
+} session_header_t;
+
 /**
  * struct snapshot_block_header - Metadata header stored before block data
  * @magic:           Magic number for the record ('SNAP')
  * @block_number:    Block number
- * @data_size:       Size of the block data
  * @checksum:        Block checksum
  */
 typedef struct snapshot_block_header {
-      u32 magic;
       u64 block_number;
-      u32 data_size;
       u32 checksum;
 } snap_block_header_t;
 

@@ -1,6 +1,11 @@
-#include "../include/utils.h"
 #include <linux/buffer_head.h>
-#include <linux/fs.h>
+#include <linux/crypto.h>
+#include <linux/err.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "../include/utils.h"
 
 #define AUDIT if (1)
 
@@ -91,4 +96,23 @@ u32 hash_str(const char *str, int bits) {
       if (bits >= 32)
             return hash;
       return hash & ((1U << bits) - 1);
+}
+
+int compress_data(struct crypto_comp *comp, const char *data, size_t data_size,
+                  struct compressed_data *out) {
+
+      struct compressed_data res;
+      int ret;
+
+      if (!data || !out)
+            return -EINVAL;
+
+      ret = crypto_comp_compress(comp, data, data_size, out->data,
+                                 (unsigned int *)&out->size);
+      if (ret) {
+            AUDIT log_err("Compression failed: %d\n", ret);
+            return ret;
+      }
+
+      return 0;
 }

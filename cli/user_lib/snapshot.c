@@ -1,6 +1,9 @@
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include "snapshot.h"
 
@@ -91,3 +94,7 @@ int sys_deactivate_snapshot(const char *devname, const char *password) {
       return ret;
 }
 #endif
+
+uint32_t compute_checksum(const char *data, size_t size, uint32_t seed) {
+      return crc32(seed, (const unsigned char *)data, size);
+}

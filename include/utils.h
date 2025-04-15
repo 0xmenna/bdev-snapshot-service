@@ -32,6 +32,11 @@ struct snapshot_args {
       char passwd[MAX_SECRET_LEN];
 };
 
+struct compressed_data {
+      char *data;
+      size_t size;
+};
+
 #define log_info(fmt, ...)                                                     \
       printk(KERN_INFO "%s: " fmt, THIS_MODULE->name, ##__VA_ARGS__)
 
@@ -53,5 +58,8 @@ void path_to_safe_name(const char *pathname, char *out_pathname, size_t len);
 u32 compute_checksum(const char *data, size_t size, u32 seed);
 
 u32 hash_str(const char *str, int bits);
+
+int compress_data(struct crypto_comp *comp, const char *data, size_t data_size,
+                  struct compressed_data *out);
 
 #endif

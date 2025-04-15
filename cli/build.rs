@@ -9,5 +9,8 @@ fn main() {
         .file("user_lib/snapshot.c")
         .compile("snapshot");
 
+    // Link the system zlib
+    println!("cargo:rustc-link-lib=z");
+
     // Cargo will automatically link the produced static library
 }

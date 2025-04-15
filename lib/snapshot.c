@@ -401,10 +401,7 @@ static void free_percpu_session_container(void *info) {
 
                   hlist_del(&entry->hnode);
 
-                  filp_close(entry->file, NULL);
-                  dput(entry->session_dentry);
-
-                  kfree(entry);
+                  free_container(entry);
 
                   return;
             }
@@ -660,7 +657,8 @@ static int unregister_device(const char *dev_name) {
 }
 
 static struct snap_session_container *
-create_snap_container(struct dentry *session_dentry, int cpu, bool is_owner) {
+create_snap_container(struct dentry *session_dentry, int cpu,
+                      size_t dev_block_size, bool is_owner) {
       struct snap_session_container *container = NULL;
       char container_fname[16];
       struct dentry *container_dentry = NULL;
@@ -703,9 +701,24 @@ create_snap_container(struct dentry *session_dentry, int cpu, bool is_owner) {
             // Take extra ref for non-owner CPUs
             dget(session_dentry);
 
+      // Write the session header to the container file
+      session_header_t header;
+      header.magic = SNAPSHOT_SESSION_MAGIC;
+      header.block_size = dev_block_size;
+
+      ret =
+          kernel_write(container->file, &header, sizeof(header), &filp->f_pos);
+      if (ret != sizeof(header)) {
+            ret = -EIO;
+            goto out_err;
+      }
+
       return container;
 
 out_err:
+      if (container) {
+            kfree(container);
+      }
       if (filp)
             filp_close(filp, NULL);
       if (container_dentry)
@@ -713,37 +726,54 @@ out_err:
       return ERR_PTR(ret);
 }
 
-static int make_snapshot(const char *session_name, struct file *container_file,
-                         sector_t block_num, size_t data_size, char *bdata) {
+static int make_snapshot(const char *session_name, struct crypto_comp *comp,
+                         struct file *container_file, sector_t block_num,
+                         size_t data_size, char *bdata) {
       snap_block_header_t header;
+      struct compressed_data compressed;
       loff_t pos;
       ssize_t written;
       int ret;
 
-      // Build the record header
-      header.magic = SNAPSHOT_RECORD_MAGIC;
-      header.block_number = block_num;
-      header.data_size = data_size;
+      compressed.size = data_size;
+      compressed.data = kmalloc(data_size, GFP_KERNEL);
+      if (!compressed.data)
+            return -ENOMEM;
 
-      u32 seed = hash_str(session_name, 32);
-      header.checksum = compute_checksum(bdata, data_size, seed);
+      // Build the record header
+      header.block_number = block_num;
+      header.checksum =
+          compute_checksum(bdata, data_size, (u32)header.block_number);
+
+      // Compress the data
+      ret = compress_data(comp, bdata, data_size, &compressed);
+      if (ret) {
+            goto out;
+      }
 
       pos = container_file->f_pos;
 
       // Write the header record
       written = kernel_write(container_file, &header, sizeof(header), &pos);
       if (written != sizeof(header)) {
-            return -EIO;
+            ret = -EIO;
+            goto out;
       }
       pos += written;
 
-      // Write the block data
-      written = kernel_write(container_file, bdata, data_size, &pos);
-      if (written != data_size) {
-            return -EIO;
+      // Write the compressed block data
+      written =
+          kernel_write(container_file, compressed.data, compressed.size, &pos);
+      if (written != compressed.size) {
+            ret = -EIO;
+            goto out;
       }
 
-      return 0;
+      ret = 0;
+
+out:
+      kfree(compressed.data);
+      return ret;
 }
 
 static int process_block(blog_work *bwork) {
@@ -796,10 +826,13 @@ static int process_block(blog_work *bwork) {
             }
       }
 
-      container =
-          create_snap_container(session_dentry, cpu, is_cpu_dentry_owner);
+      container = create_snap_container(session_dentry, cpu,
+                                        bwork->inode->i_sb->s_blocksize,
+                                        is_cpu_dentry_owner);
 
       if (IS_ERR(container)) {
+            if (is_cpu_dentry_owner)
+                  dput(session_dentry);
             ret = PTR_ERR(container);
             return ret;
       }
@@ -811,8 +844,9 @@ static int process_block(blog_work *bwork) {
 
 make_snapshot:
 
-      ret = make_snapshot(session_dentry->d_name.name, container->file,
-                          bwork->block, bwork->data_size, bwork->orig_data);
+      ret = make_snapshot(session_dentry->d_name.name, container->comp,
+                          container->file, bwork->block, bwork->data_size,
+                          bwork->orig_data);
       if (ret) {
             // No need to free the container since it could be used by later
             // snapshot operations. Free is demanded at the end of the session.
