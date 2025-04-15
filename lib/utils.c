@@ -86,7 +86,8 @@ void path_to_safe_name(const char *pathname, char *out_pathname, size_t len) {
 }
 
 u32 compute_checksum(const char *data, size_t size, u32 seed) {
-      return crc32(seed, (const unsigned char *)data, size);
+      return crc32(seed ^ 0xffffffff, (const unsigned char *)data, size) ^
+             0xffffffff;
 }
 
 u32 hash_str(const char *str, int bits) {

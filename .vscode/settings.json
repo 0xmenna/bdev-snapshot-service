@@ -21,7 +21,13 @@
             "singlefilefs.h": "c",
             "ioctl.h": "c",
             "snapshot_syscall_lib.h": "c",
-            "snapshot.h": "c"
+            "snapshot.h": "c",
+            "bit": "c",
+            "concepts": "c",
+            "cstdio": "c",
+            "type_traits": "c",
+            "new": "c",
+            "typeinfo": "c"
       },
       "C_Cpp.errorSquiggles": "disabled",
 }

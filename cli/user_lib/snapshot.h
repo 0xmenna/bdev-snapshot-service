@@ -23,4 +23,8 @@ int sys_deactivate_snapshot(const char *devname, const char *password);
 
 uint32_t compute_checksum(const char *data, size_t size, uint32_t seed);
 
+int decompress_deflate(const unsigned char *in_data, size_t in_size,
+                       unsigned char *out_data, size_t out_capacity,
+                       size_t *out_size);
+
 #endif

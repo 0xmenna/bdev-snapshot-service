@@ -1,5 +1,4 @@
 use clap::{Parser, ValueEnum};
-use std::fs;
 
 /// CLI tool to manage the snapshot service.
 #[derive(Parser, Debug)]
@@ -29,53 +28,30 @@ enum CommandType {
     Restore,
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
     match args.command {
         CommandType::Activate => {
-            let password = get_password(args.passfile);
-            if let Err(e) = snapshot::activate_snapshot(&args.dev, &password) {
-                eprintln!("Error activating snapshot: {:?}", e);
-            } else {
-                println!("Snapshot activated successfully.");
-            }
+            let password = utils::get_password(args.passfile);
+            service::activate_snapshot(&args.dev, &password);
+            Ok(())
         }
         CommandType::Deactivate => {
-            let password = get_password(args.passfile);
-            if let Err(e) = snapshot::deactivate_snapshot(&args.dev, &password) {
-                eprintln!("Error deactivating snapshot: {:?}", e);
-            } else {
-                println!("Snapshot deactivated successfully.");
-            }
+            let password = utils::get_password(args.passfile);
+            service::deactivate_snapshot(&args.dev, &password);
+            Ok(())
         }
         CommandType::Restore => {
             let dir = args.session.as_ref().unwrap_or_else(|| {
-                eprintln!("--session is required for restore");
+                utils::log_error("Session path is required for restore");
                 std::process::exit(1);
             });
 
-            if let Err(e) = snapshot::restore_snapshot(&args.dev, dir) {
-                eprintln!("Error restoring snapshot: {:?}", e);
-            } else {
-                println!("Snapshot restored successfully.");
-            }
+            service::restore_snapshot(&args.dev, dir)
         }
-    };
-}
-
-fn get_password(passfile: Option<String>) -> String {
-    if let Some(passfile) = passfile {
-        let password = fs::read_to_string(&passfile).unwrap_or_else(|e| {
-            eprintln!("Error reading password file {}: {}", &passfile, e);
-            std::process::exit(1);
-        });
-        let password = password.trim();
-        password.to_string()
-    } else {
-        eprintln!("Provide the password file");
-        std::process::exit(1);
     }
 }
 
-mod snapshot;
+mod service;
+mod utils;

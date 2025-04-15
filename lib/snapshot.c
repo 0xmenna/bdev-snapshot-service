@@ -658,7 +658,7 @@ static int unregister_device(const char *dev_name) {
 
 static struct snap_session_container *
 create_snap_container(struct dentry *session_dentry, int cpu,
-                      size_t dev_block_size, bool is_owner) {
+                      u32 dev_block_size, bool is_owner) {
       struct snap_session_container *container = NULL;
       char container_fname[16];
       struct dentry *container_dentry = NULL;
@@ -740,16 +740,17 @@ static int make_snapshot(const char *session_name, struct crypto_comp *comp,
       if (!compressed.data)
             return -ENOMEM;
 
-      // Build the record header
-      header.block_number = block_num;
-      header.checksum =
-          compute_checksum(bdata, data_size, (u32)header.block_number);
-
       // Compress the data
       ret = compress_data(comp, bdata, data_size, &compressed);
       if (ret) {
             goto out;
       }
+
+      // Build the record header
+      header.block_number = block_num;
+      header.compressed_size = compressed.size;
+      header.checksum =
+          compute_checksum(bdata, data_size, (u32)header.block_number);
 
       pos = container_file->f_pos;
 
@@ -826,8 +827,7 @@ static int process_block(blog_work *bwork) {
             }
       }
 
-      container = create_snap_container(session_dentry, cpu,
-                                        bwork->inode->i_sb->s_blocksize,
+      container = create_snap_container(session_dentry, cpu, bwork->data_size,
                                         is_cpu_dentry_owner);
 
       if (IS_ERR(container)) {

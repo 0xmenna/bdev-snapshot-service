@@ -98,3 +98,28 @@ int sys_deactivate_snapshot(const char *devname, const char *password) {
 uint32_t compute_checksum(const char *data, size_t size, uint32_t seed) {
       return crc32(seed, (const unsigned char *)data, size);
 }
+
+int decompress_deflate(const unsigned char *in_data, size_t in_size,
+                       unsigned char *out_data, size_t out_capacity,
+                       size_t *out_size) {
+      z_stream strm = {0};
+      strm.next_in = (Bytef *)in_data;
+      strm.avail_in = in_size;
+      strm.next_out = out_data;
+      strm.avail_out = out_capacity;
+
+      // Initialize for raw DEFLATE (windowBits = -MAX_WBITS)
+      if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
+            return -1;
+      }
+
+      int ret = inflate(&strm, Z_FINISH);
+      if (ret != Z_STREAM_END) {
+            inflateEnd(&strm);
+            return -2;
+      }
+
+      *out_size = strm.total_out;
+      inflateEnd(&strm);
+      return 0;
+}

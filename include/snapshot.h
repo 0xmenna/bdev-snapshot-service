@@ -41,27 +41,27 @@
 #include "hlist_rcu.h"
 #include "utils.h"
 
-/* Snapshot subsystem internal error codes */
-#define NODEV 1
-#define DEXIST 2
-#define NOSDEV 3
-#define AUTHF 4
-#define SBUSY 5
-#define MODUNLOAD 6
-#define SESSIONOVFLW 7
-#define SDEVNOTACTIVE 8
-#define NOPHYSBLOCK 9
-#define NOBHEAD 10
-#define NOMNTD 11
-#define PATHEXIST 12
-#define FREE_SDEV 13
-#define FREE_SDEV_NO_SESSION 14
-#define SNAPDIR_EXIST 15
-#define FREE_RCU 16
-#define NOFDEV 17
-#define BLOCK_COMMITTED 18
-#define NO_RBLOCK 19
-#define RESCHED 20
+/* Snapshot subsystem internal codes */
+#define NODEV 101
+#define DEXIST 102
+#define NOSDEV 103
+#define AUTHF 104
+#define SBUSY 105
+#define MODUNLOAD 106
+#define SESSIONOVFLW 107
+#define SDEVNOTACTIVE 108
+#define NOPHYSBLOCK 109
+#define NOBHEAD 110
+#define NOMNTD 111
+#define PATHEXIST 112
+#define FREE_SDEV 113
+#define FREE_SDEV_NO_SESSION 114
+#define SNAPDIR_EXIST 115
+#define FREE_RCU 116
+#define NOFDEV 117
+#define BLOCK_COMMITTED 118
+#define NO_RBLOCK 119
+#define RESCHED 120
 
 #define AUDIT if (1)
 #define DEBUG_ASSERT(cond) BUG_ON(!(cond))
@@ -211,7 +211,7 @@ alloc_session_container(struct dentry *dentry, struct file *file) {
       if (!c) {
             return NULL;
       }
-      comp = crypto_alloc_comp("zlib-deflate", 0, 0);
+      comp = crypto_alloc_comp("deflate", 0, 0);
       if (IS_ERR(comp)) {
             AUDIT log_err("Failed to allocate compressor: %ld\n",
                           PTR_ERR(comp));
@@ -332,7 +332,7 @@ static inline void free_blog_work(blog_work *bwork) {
 
 typedef struct session_header {
       u32 magic;
-      size_t block_size;
+      u32 block_size;
 } session_header_t;
 
 /**
@@ -343,6 +343,7 @@ typedef struct session_header {
  */
 typedef struct snapshot_block_header {
       u64 block_number;
+      u32 compressed_size;
       u32 checksum;
 } snap_block_header_t;
 
