@@ -2,6 +2,7 @@
 #define SNAPSHOT_H
 
 #include <linux/atomic.h>
+#include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/cdev.h>
@@ -29,6 +30,7 @@
 #include <linux/sched.h>
 #include <linux/signal.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/time.h>
@@ -130,39 +132,42 @@ typedef struct generic_dev {
 
 /**
  * struct snap_block - Tracked block modified during a snapshot session
- * @block:         Physical block number
- * @inode:         Inode of the file being modified: useful to avoid umouting
- * the fs
+ * @block:         Block number (might assume a different meaning in the context
+ * of different fs)
+ * @mnt:        Mount point of the file system to avoid unmount
  * @cb_hnode:      Node for committed blocks
  * @rb_hnode:      Node for reading blocks
  */
 struct snap_block {
-      sector_t block;
-      struct inode *inode;
+      u64 block;
+      struct vfsmount *mnt;
       struct hlist_node cb_hnode;
       struct hlist_node rb_hnode;
 };
 
-static inline void INIT_SNAP_BLOCK(struct snap_block *sb, struct inode *inode,
-                                   sector_t block) {
+static inline void INIT_SNAP_BLOCK(struct snap_block *sb, struct vfsmount *mnt,
+                                   u64 block) {
       sb->block = block;
-      sb->inode = inode;
+      sb->mnt = mnt;
       INIT_HLIST_NODE(&sb->cb_hnode);
       INIT_HLIST_NODE(&sb->rb_hnode);
 }
 
 static inline void sb_free(struct snap_block *sb) {
-      iput(sb->inode);
+      if (sb->mnt) {
+            mntput(sb->mnt);
+      }
       kfree(sb);
 }
 
-static inline u32 hash_block(sector_t block) {
+static inline u32 hash_block(u64 block) {
       return hash_64(block, S_BLOCKS_HASH_BITS);
 }
 
 /**
  * struct _snapshot_session - Represents a snapshot mount session
  * @mount_timestamp:   Timestamp of the session start
+ * @mnt:              Mount point of the file system
  * @snap_dentry:       Dentry for the snapshot session
  * @reading_blocks:    Blocks that must be read (by kretprobe of `sb_read`)
  * @rb_locks:          Per-bucket locks for reading_blocks
@@ -171,6 +176,7 @@ static inline u32 hash_block(sector_t block) {
  */
 typedef struct _snapshot_session {
       u64 mount_timestamp;
+      struct vfsmount *mnt;
       struct dentry *snap_dentry;
       struct hlist_head reading_blocks[1 << S_BLOCKS_HASH_BITS];
       spinlock_t rb_locks[1 << S_BLOCKS_HASH_BITS];
@@ -179,8 +185,10 @@ typedef struct _snapshot_session {
 } snapshot_session;
 
 static inline void init_snapshot_session(snapshot_session *snap_session,
-                                         time64_t timestamp) {
+                                         time64_t timestamp,
+                                         struct vfsmount *mnt) {
       snap_session->snap_dentry = NULL;
+      snap_session->mnt = mnt;
       snap_session->mount_timestamp = timestamp;
 }
 
@@ -294,7 +302,7 @@ static inline u32 hash_dev(dev_t dev) {
 /**
  * struct block_log_work - Work to log a block before overwrite
  * @session_dentry:    Dentry for the session
- * @inode:             Inode of the file being modifed
+ * @mnt:               Reference to the mount point to avoid unmounting
  * @block:             Block number
  * @orig_data:         Snapshot of block data
  * @data_size:         Size of data
@@ -302,18 +310,19 @@ static inline u32 hash_dev(dev_t dev) {
  */
 typedef struct block_log_work {
       struct dentry *session_dentry;
-      struct inode *inode;
-      sector_t block;
+      struct vfsmount *mnt;
+      u64 block;
       char *orig_data;
-      size_t data_size;
+      unsigned int data_size;
       struct work_struct work;
 } blog_work;
 
 static inline void INIT_BLOG_WORK(blog_work *work, struct dentry *dentry,
-                                  sector_t block, char *bdata, size_t data_size,
+                                  u64 block, char *bdata,
+                                  unsigned int data_size,
                                   void (*work_f)(struct work_struct *)) {
       work->session_dentry = dentry;
-      work->inode = NULL;
+      work->mnt = NULL;
       work->block = block;
       work->orig_data = bdata;
       work->data_size = data_size;
@@ -324,28 +333,24 @@ static inline void free_blog_work(blog_work *bwork) {
       if (bwork->orig_data) {
             kfree(bwork->orig_data);
       }
-      if (bwork->inode) {
-            iput(bwork->inode);
+      if (bwork->mnt) {
+            mntput(bwork->mnt);
       }
       kfree(bwork);
 }
 
 typedef struct session_header {
       u32 magic;
-      u32 block_size;
+      unsigned int block_size;
 } session_header_t;
 
-/**
- * struct snapshot_block_header - Metadata header stored before block data
- * @magic:           Magic number for the record ('SNAP')
- * @block_number:    Block number
- * @checksum:        Block checksum
- */
-typedef struct snapshot_block_header {
+typedef struct snapshot_record_header {
       u64 block_number;
-      u32 compressed_size;
+      unsigned int compressed_size;
+      bool is_compressed;
+      unsigned int data_size;
       u32 checksum;
-} snap_block_header_t;
+} snap_record_header_t;
 
 int register_my_kretprobes(void);
 void unregister_my_kretprobes(void);
@@ -353,7 +358,7 @@ void unregister_my_kretprobes(void);
 int init_snapshot_path(void);
 void put_snapshot_path(void);
 
-inline void init_devices(void);
+inline void init_devices(bool is_testing_fs);
 
 int init_work_queue(int max_active);
 void cleanup_work_queue(void);

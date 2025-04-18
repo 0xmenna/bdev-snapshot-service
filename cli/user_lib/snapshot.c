@@ -23,7 +23,7 @@
 
 /* Structure shared with the kernel module */
 struct snapshot_args {
-      char dev_name[1024];
+      char dev_name[256];
       char passwd[64];
 };
 

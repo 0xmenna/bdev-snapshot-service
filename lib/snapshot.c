@@ -9,6 +9,14 @@ static struct path snapshot_root_path;
 /* Registered devices to the snapshot subsystem */
 static struct snapshot_devices devices;
 
+/*
+ * Two operational modes:
+ * 1) TESTING (singlefilefs): Fully spec-compliant, primarely hooks buffer
+ * cache. 2) GENERIC (other FS): Experimental - hooks submit_bio at block layer.
+ * WARNING: Generic mode may violate a bit the specifications.
+ */
+static bool testing_filesystem = true;
+
 /* Per-CPU containers for active snapshot sessions. Each
     file container (one per cpu) can hold multiple block log entries */
 static DEFINE_PER_CPU(struct hlist_head[1 << DEFAULT_HASH_BITS],
@@ -17,7 +25,10 @@ static DEFINE_PER_CPU(struct hlist_head[1 << DEFAULT_HASH_BITS],
 /* Workqueue for block log processing */
 static struct workqueue_struct *block_log_wq;
 
-inline void init_devices(void) { INIT_LIST_HEAD(&devices.fdevices); }
+inline void init_devices(bool is_testing_fs) {
+      INIT_LIST_HEAD(&devices.fdevices);
+      testing_filesystem = is_testing_fs;
+}
 
 int init_snapshot_path(void) {
       int error;
@@ -38,18 +49,17 @@ int init_snapshot_path(void) {
       if (error)
             return error;
 
-      dentry = d_alloc_name(root_path.dentry, "snapshot");
-      if (!dentry) {
-            error = -ENOMEM;
+      dentry = lookup_one_len("snapshot", root_path.dentry, strlen("snapshot"));
+      if (IS_ERR(dentry)) {
+            error = PTR_ERR(dentry);
             goto cleanup_root;
       }
 
       error = vfs_mkdir(root_path.mnt->mnt_idmap, d_inode(root_path.dentry),
-                        dentry, 0500);
+                        dentry, 0660);
       if (error)
             goto cleanup_all;
 
-      /* Now that the directory is created, get its path */
       error = kern_path("/snapshot", LOOKUP_DIRECTORY, &snapshot_root_path);
       if (!error) {
             log_info("Root Snapshot directory created\n");
@@ -174,10 +184,6 @@ static inline int map_filedev_callback(file_dev_t *fdev, void *arg) {
 static inline void put_fdev_callback(struct rcu_head *rcu) {
       file_dev_t *fdev = container_of(rcu, file_dev_t, rcu);
 
-      AUDIT log_info(
-          "Callback free: loop backing file : %s , preempt_count : %d\n",
-          fdev_name(fdev), preempt_count());
-
       dput(fdev->dentry);
       kfree(fdev);
 }
@@ -275,7 +281,7 @@ struct session_dentry_metadata {
 static int session_dentry_callback(snap_device *sdev, void *arg) {
       struct tm tm;
       char date_str[16]; // Format: YYYYMMDD_HHMMSS
-      char snap_subdirname[1056];
+      char snap_subdirname[288];
       struct dentry *session_dentry = NULL;
       int ret;
 
@@ -292,8 +298,8 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
 
       // Format the timestamp into a date string: YYYYMMDD_HHMMSS
       time64_to_tm(sdev->session->mount_timestamp, 0, &tm);
-      snprintf(date_str, sizeof(date_str), "%04ld%02ld%02ld_%02ld%02ld%02ld",
-               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+      snprintf(date_str, sizeof(date_str), "%04ld%02d%02d_%02d%02d%02d",
+               tm.tm_year + (long)1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
                tm.tm_min, tm.tm_sec);
 
       // Build the snapshot subdirectory name: "<dev_name>_<date_str>"
@@ -344,13 +350,14 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
       return FREE_SDEV_NO_SESSION;
 }
 
-/* Create a new snapshot session on mount of a registered snapshot device.
+/* Create a new snapshot session of a registered snapshot device.
 It is used within `rcu_compute_on_sdev`. */
-static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
+static int new_session_callback(snap_device *sdev, void *arg) {
       snap_device *old_sdev, *new_sdev;
       snapshot_session *session;
       time64_t mount_timestamp;
-      int error;
+
+      struct vfsmount *mnt = arg;
 
       if (!sdev) {
             return -NOSDEV;
@@ -364,7 +371,7 @@ static int new_session_on_mount_callback(snap_device *sdev, void *arg) {
       }
 
       mount_timestamp = ktime_get_real_seconds();
-      init_snapshot_session(session, mount_timestamp);
+      init_snapshot_session(session, mount_timestamp, mnt);
 
       old_sdev = sdev;
       new_sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
@@ -442,10 +449,6 @@ static void free_sdev(snap_device *sdev) {
 static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
 
-      AUDIT log_info(
-          "Callback free (no session): block device : %s, preempt_count : %d\n",
-          sdev_name(sdev), preempt_count());
-
       kfree(sdev);
 }
 
@@ -453,9 +456,6 @@ static inline void free_sdev_no_session_callback(struct rcu_head *rcu) {
 function. */
 static inline void free_sdev_callback(struct rcu_head *rcu) {
       snap_device *sdev = container_of(rcu, snap_device, rcu);
-
-      AUDIT log_info("Callback free: block device : %s, preempt_count : %d\n",
-                     sdev_name(sdev), preempt_count());
 
       free_sdev(sdev);
 }
@@ -507,13 +507,12 @@ static int get_dev_by_name(const char *dev_name, generic_dev_t *dev) {
       int error;
 
       int dev_len = strlen(dev_name);
-
       if (dev_len >= MAX_DEV_LEN || dev_len == 0) {
             return -EINVAL;
       }
 
       // Check if the device name is a path
-      if (!strchr(dev_name, '/')) {
+      if (dev_name[0] != '/') {
             const char *dev_path = "/dev/";
             int len = strlen(dev_path) + dev_len;
             if (len >= MAX_DEV_LEN) {
@@ -632,7 +631,7 @@ static int unregister_device(const char *dev_name) {
       case BDEV:
             error = rcu_compute_on_sdev(dev.dev, NULL, remove_sdev_callback);
             if (error) {
-                  log_info("Unregister Device: Cannot remove block device %d. "
+                  log_info("Unregister Device: Cannot remove block device %u. "
                            "Error: "
                            "%d\n",
                            dev.dev, error);
@@ -658,7 +657,7 @@ static int unregister_device(const char *dev_name) {
 
 static struct snap_session_container *
 create_snap_container(struct dentry *session_dentry, int cpu,
-                      u32 dev_block_size, bool is_owner) {
+                      unsigned int block_size, bool is_owner) {
       struct snap_session_container *container = NULL;
       char container_fname[16];
       struct dentry *container_dentry = NULL;
@@ -704,7 +703,7 @@ create_snap_container(struct dentry *session_dentry, int cpu,
       // Write the session header to the container file
       session_header_t header;
       header.magic = SNAPSHOT_SESSION_MAGIC;
-      header.block_size = dev_block_size;
+      header.block_size = block_size;
 
       ret =
           kernel_write(container->file, &header, sizeof(header), &filp->f_pos);
@@ -727,9 +726,9 @@ out_err:
 }
 
 static int make_snapshot(const char *session_name, struct crypto_comp *comp,
-                         struct file *container_file, sector_t block_num,
-                         size_t data_size, char *bdata) {
-      snap_block_header_t header;
+                         struct file *container_file, u64 block_num,
+                         unsigned int data_size, char *bdata) {
+      snap_record_header_t header;
       struct compressed_data compressed;
       loff_t pos;
       ssize_t written;
@@ -742,15 +741,27 @@ static int make_snapshot(const char *session_name, struct crypto_comp *comp,
 
       // Compress the data
       ret = compress_data(comp, bdata, data_size, &compressed);
+      bool use_compression = true;
       if (ret) {
-            goto out;
+            // Compression failed (e.g. the compressed data is larger then the
+            // original and does not fit in the buffer).
+            // Fallback to original uncompressed data
+            use_compression = false;
       }
 
       // Build the record header
       header.block_number = block_num;
-      header.compressed_size = compressed.size;
+      header.compressed_size = use_compression ? compressed.size : 0;
+      header.is_compressed = use_compression;
+      header.data_size = data_size;
       header.checksum =
           compute_checksum(bdata, data_size, (u32)header.block_number);
+
+      AUDIT log_info(
+          "Logging block %llu. Session: %s. Compressed size: %u. Data size: "
+          "%u. Checksum: %u\n",
+          header.block_number, session_name, header.compressed_size,
+          header.data_size, header.checksum);
 
       pos = container_file->f_pos;
 
@@ -762,16 +773,16 @@ static int make_snapshot(const char *session_name, struct crypto_comp *comp,
       }
       pos += written;
 
-      // Write the compressed block data
-      written =
-          kernel_write(container_file, compressed.data, compressed.size, &pos);
-      if (written != compressed.size) {
+      // Write the data
+      char *data_to_write = use_compression ? compressed.data : bdata;
+      unsigned int write_size = use_compression ? compressed.size : data_size;
+      written = kernel_write(container_file, data_to_write, write_size, &pos);
+      if (written != write_size) {
             ret = -EIO;
             goto out;
       }
 
       ret = 0;
-
 out:
       kfree(compressed.data);
       return ret;
@@ -782,15 +793,16 @@ static int process_block(blog_work *bwork) {
       struct dentry *session_dentry;
       bool is_cpu_dentry_owner; // whether the CPU is the creator of the dentry
       struct snap_session_container *container;
+      unsigned int block_size;
       int ret;
 
       int cpu = smp_processor_id();
 
-      dev = bwork->inode->i_sb->s_bdev->bd_dev;
+      dev = bwork->mnt->mnt_sb->s_bdev->bd_dev;
       session_dentry = bwork->session_dentry;
 
       AUDIT log_info(
-          "Processing block log work on CPU %d. Device: %d, Block: %d\n", cpu,
+          "Processing block log work on CPU %d. Device: %u, Block: %llu\n", cpu,
           dev, bwork->block);
 
       if (!session_dentry) {
@@ -827,7 +839,13 @@ static int process_block(blog_work *bwork) {
             }
       }
 
-      container = create_snap_container(session_dentry, cpu, bwork->data_size,
+      if (testing_filesystem) {
+            block_size = bwork->mnt->mnt_sb->s_blocksize;
+      } else {
+            block_size = bdev_logical_block_size(bwork->mnt->mnt_sb->s_bdev);
+      }
+
+      container = create_snap_container(session_dentry, cpu, block_size,
                                         is_cpu_dentry_owner);
 
       if (IS_ERR(container)) {
@@ -839,8 +857,9 @@ static int process_block(blog_work *bwork) {
 
       hlist_add_head(&container->hnode, &containers[hash]);
 
-      log_info("Created new session container on CPU %d. Session: %s\n", cpu,
-               container->session_dentry->d_name.name);
+      log_info("Created new session container on CPU %d. Session: %s. Block "
+               "size: %u\n",
+               cpu, container->session_dentry->d_name.name, block_size);
 
 make_snapshot:
 
@@ -853,7 +872,7 @@ make_snapshot:
             return ret;
       }
 
-      log_info("Snapshot done. CPU: %d, Session: %s, Block: %d", cpu,
+      log_info("Snapshot done. CPU: %d, Session: %s, Block: %llu", cpu,
                session_dentry->d_name.name, bwork->block);
 
       return 0;
@@ -867,8 +886,8 @@ static void process_block_log(struct work_struct *work) {
 
       ret = process_block(bwork);
       if (ret == RESCHED) {
-            log_info("Rescheduling work. Device: %d, Block: %d\n",
-                     bwork->inode->i_sb->s_bdev->bd_dev, bwork->block);
+            log_info("Rescheduling work. Device: %u, Block: %llu\n",
+                     bwork->mnt->mnt_sb->s_bdev->bd_dev, bwork->block);
 
             queue_work(block_log_wq, &bwork->work);
 
@@ -879,11 +898,105 @@ static void process_block_log(struct work_struct *work) {
       free_blog_work(bwork);
 }
 
+static int try_new_snapshot_session(struct dentry *dentry,
+                                    struct vfsmount *mnt) {
+      struct block_device *bdev = dentry->d_sb->s_bdev;
+      int ret;
+      if (MAJOR(bdev->bd_dev) == LOOP_MAJOR) {
+            // Loop device
+
+            // We first check that there is no snapshot device mapped to the
+            // device-file
+            ret = rcu_compute_on_sdev(bdev->bd_dev, NULL, no_sdev_callback);
+
+            if (ret) {
+                  return ret;
+            }
+
+            // Extract the backing file of the loop device
+            struct file *lo_backing_file;
+            lo_backing_file =
+                ((struct loop_device_meta *)bdev->bd_disk->private_data)
+                    ->lo_backing_file;
+
+            // Check if the backing file is registered within the
+            // `fdevices` list. If it is we also get the device name
+            char *dev_name;
+            ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
+                                         &dev_name,
+                                         lo_backing_file_exists_callback);
+
+            if (ret) {
+                  // The device-file is not registered
+                  return ret;
+            }
+
+            // The device-file is registered. We can create a new snapshot
+            // device and activate a new session
+            snap_device tmp_sdev, *sdev;
+            INIT_SNAP_DEVICE(&tmp_sdev, bdev->bd_dev, dev_name);
+
+            sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
+            if (!sdev) {
+                  return -ENOMEM;
+            }
+            memcpy(sdev, &tmp_sdev, sizeof(snap_device));
+
+            // Create the session
+            snapshot_session *session;
+            time64_t mount_timestamp;
+
+            session = kmalloc(sizeof(snapshot_session), GFP_ATOMIC);
+            if (!session) {
+                  kfree(sdev);
+                  return -ENOMEM;
+            }
+
+            mount_timestamp = ktime_get_real_seconds();
+            init_snapshot_session(session, mount_timestamp, mnt);
+            sdev->session = session;
+            sdev->private_data = (void *)lo_backing_file->f_path.dentry;
+
+            // Register the snapshot device
+            rcu_register_snapdevice(sdev);
+            AUDIT log_info(
+                "mount_ret_handler: loop device %u registered with a new "
+                "session. "
+                "Backing file %s\n",
+                sdev->dev, sdev_name(sdev));
+
+            // Map the device-file
+            bool map = true;
+            ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry, &map,
+                                         map_filedev_callback);
+            if (ret) {
+                  kfree(session);
+                  kfree(sdev);
+                  return ret;
+            }
+
+      } else {
+            // A regular block device
+
+            // Don't really care about the error. If the device is not
+            // registered it simply won't perform any action.
+            ret = rcu_compute_on_sdev(bdev->bd_dev, (void *)mnt,
+                                      new_session_callback);
+            if (ret) {
+                  return ret;
+            }
+
+            AUDIT log_info(
+                "mount_ret_handler: new session for block device %u\n",
+                bdev->bd_dev);
+      }
+
+      return 0;
+}
+
 static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                                   struct pt_regs *regs) {
       struct dentry *mnt_dentry;
-      dev_t dev;
-      snap_device *sdev;
       int ret;
 
       mnt_dentry = dget((struct dentry *)regs_return_value(regs));
@@ -891,94 +1004,15 @@ static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
             goto ret_handler;
 
       if (mnt_dentry->d_sb->s_bdev) {
-            struct block_device *bdev = mnt_dentry->d_sb->s_bdev;
-            if (MAJOR(bdev->bd_dev) == LOOP_MAJOR) {
-                  // Loop device
-
-                  // Extract the backing file of the loop device
-                  struct file *lo_backing_file;
-                  lo_backing_file =
-                      ((struct loop_device_meta *)bdev->bd_disk->private_data)
-                          ->lo_backing_file;
-
-                  // Check if the backing file is registered within the
-                  // `fdevices` list. If it is we also get the device name
-                  char *dev_name;
-                  ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
-                                               &dev_name,
-                                               lo_backing_file_exists_callback);
-
-                  if (ret) {
-                        // The device-file is not registered
-                        goto ret_handler;
-                  }
-
-                  // The device-file is registered. We can create a new snapshot
-                  // device and activate a new session
-                  snap_device tmp_sdev, *sdev;
-                  INIT_SNAP_DEVICE(&tmp_sdev, bdev->bd_dev, dev_name);
-
-                  ret = rcu_compute_on_sdev(d_num(&tmp_sdev), NULL,
-                                            no_sdev_callback);
-
-                  if (unlikely(ret)) {
-                        goto ret_handler;
-                  }
-                  sdev = kmalloc(sizeof(snap_device), GFP_ATOMIC);
-                  if (!sdev) {
-                        goto ret_handler;
-                  }
-                  memcpy(sdev, &tmp_sdev, sizeof(snap_device));
-
-                  // Create the session
-                  snapshot_session *session;
-                  time64_t mount_timestamp;
-
-                  session = kmalloc(sizeof(snapshot_session), GFP_ATOMIC);
-                  if (!session) {
-                        kfree(sdev);
-                        goto ret_handler;
-                  }
-
-                  mount_timestamp = ktime_get_real_seconds();
-                  init_snapshot_session(session, mount_timestamp);
-                  sdev->session = session;
-                  sdev->private_data = (void *)lo_backing_file->f_path.dentry;
-
-                  // Register the snapshot device
-                  rcu_register_snapdevice(sdev);
-                  AUDIT log_info(
-                      "mount_ret_handler: loop device %d registered with a new "
-                      "session. "
-                      "Backing file %s\n",
-                      sdev->dev, sdev_name(sdev));
-
-                  // Map the device-file
-                  bool map = true;
-                  ret = rcu_compute_on_filedev(lo_backing_file->f_path.dentry,
-                                               &map, map_filedev_callback);
-                  if (ret) {
-                        kfree(session);
-                        kfree(sdev);
-                        goto ret_handler;
-                  }
-
-            } else {
-                  // A regular block device
-
-                  // Don't really care about the error. If the device is not
-                  // registered it simply won't perform any action.
-                  rcu_compute_on_sdev(bdev->bd_dev, NULL,
-                                      new_session_on_mount_callback);
-                  AUDIT log_info(
-                      "mount_ret_handler: new session for block device %d\n",
-                      bdev->bd_dev);
+            ret = try_new_snapshot_session(mnt_dentry, NULL);
+            if (ret) {
+                  log_err("Error during device %u mounting: %d\n",
+                          mnt_dentry->d_sb->s_bdev->bd_dev, ret);
             }
       }
 
-      dput(mnt_dentry);
-
 ret_handler:
+      dput(mnt_dentry);
       return 0;
 }
 
@@ -1010,7 +1044,7 @@ static int free_session_on_umount_callback(snap_device *sdev, void *arg) {
 
             // Unregister the snapshot device
             rcu_unregister_snapdevice(sdev);
-            AUDIT log_info("umount_callback: Loop device %d unregistered with "
+            AUDIT log_info("umount_callback: Loop device %u unregistered with "
                            "backing file %s\n",
                            sdev->dev, sdev_name(sdev));
       } else {
@@ -1081,14 +1115,16 @@ static struct kretprobe rp_umount = {
     .entry_handler = umount_entry_handler,
     .handler = umount_ret_handler,
     .data_size = sizeof(struct umount_kretprobe_metadata),
+    .maxactive = 20,
 };
 
 struct write_metadata {
       struct inode *inode;
+      struct vfsmount *mnt;
       loff_t offset;
       size_t count;
 
-      sector_t out_block;
+      u64 block;
 };
 
 /* Callback function used to acquire the block number that will eventually be
@@ -1099,9 +1135,9 @@ subsequent write will not be captured because the block was already copied.
 NOTE: As of now we support a single block write at a time. */
 static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       snapshot_session *session;
+      struct vfsmount *mnt;
       struct snap_block *snap_block;
       struct write_metadata *wm;
-      sector_t block;
 
       if (!sdev) {
             return -NOSDEV;
@@ -1113,19 +1149,34 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       session = sdev->session;
       wm = (struct write_metadata *)arg;
 
-      int ret = get_block(wm->inode, wm->offset, &block);
-      if (ret) {
-            return ret;
-      }
+      mnt = testing_filesystem ? wm->mnt : session->mnt;
+      AUDIT DEBUG_ASSERT(mnt != NULL);
 
-      wm->out_block = block;
+      // This vfsmount will traverse a chain. If it passes through all steps, it
+      // will be released at the end of the deferred working process. If one of
+      // the steps fails to go through, it will be released before.
+
+      // vfsmount chain step 1.
+      mnt = mntget(mnt);
+
+      if (testing_filesystem) {
+            // We simply retrieve the physical block number being overwritten.
+            // Since in many filesystem it can be a blocking function, we only
+            // use it for the testing_fs (which we know is not blocking).
+            int ret = get_block(wm->inode, wm->offset, &wm->block);
+            DEBUG_ASSERT(!ret);
+      }
+      // If is not a testing filesystem, the block is passed as an argument by
+      // the caller
 
       snap_block = kmalloc(sizeof(struct snap_block), GFP_ATOMIC);
       if (!snap_block) {
+            // End of vfsmount at chain step 1.
+            mntput(mnt);
             return -ENOMEM;
       }
 
-      INIT_SNAP_BLOCK(snap_block, wm->inode, block);
+      INIT_SNAP_BLOCK(snap_block, mnt, wm->block);
       u32 b_hash = hash_block(snap_block->block);
 
       // Add the block to the committed blocks (if it does not exist already)
@@ -1137,11 +1188,15 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
                   spin_unlock(&session->cb_locks[b_hash]);
 
                   AUDIT log_info("record_block_on_write_callback: Snapshot "
-                                 "device : %s; Block %d is "
+                                 "device : %s; Block %llu is "
                                  "already committed\n",
                                  sdev_name(sdev), snap_block->block);
 
                   kfree(snap_block);
+
+                  // End of vfsmount at chain step 1.
+                  mntput(mnt);
+
                   return -BLOCK_COMMITTED;
             }
       }
@@ -1150,15 +1205,15 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       spin_unlock(&session->cb_locks[b_hash]);
 
       AUDIT log_info(
-          "record_block_on_write_callback: Snapshot device : %s; Block %d "
+          "record_block_on_write_callback: Snapshot device : %s; Block %llu "
           "committed\n",
           sdev_name(sdev), snap_block->block);
 
       // Add the block to the reading blocks
       spin_lock(&session->rb_locks[b_hash]);
-      // inode chain step 2. The inode is held by the `snap_block` and stored in
-      // the reading_blocks. The `snap_block` is also stored in the committed
-      // list, but the lifecycle of the inode is only dependent to the
+      // vfsmount chain step 2. The vfsmount is held by the `snap_block` and
+      // stored in the reading_blocks. The `snap_block` is also stored in the
+      // committed list, but the lifecycle of the inode is only dependent to the
       // `rading_blocks` list.
       hlist_add_head(&snap_block->rb_hnode, &session->reading_blocks[b_hash]);
       spin_unlock(&session->rb_locks[b_hash]);
@@ -1168,48 +1223,61 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
 
 struct write_kretprobe_metadata {
       dev_t dev;
-      sector_t block;
+      u64 block;
 };
 
 static int pre_write_handler(struct file *file, loff_t *off, size_t count,
                              struct write_kretprobe_metadata *out_meta) {
       struct write_metadata wm;
-      loff_t offset;
       int ret;
 
-      if (!file || !file->f_inode || !off)
+      if (!file || !off)
             return -EINVAL;
 
-      offset = *off;
-
-      // This inode will traverse a chain. If it passes through all steps, it
-      // will be released at the end of the deferred working process. If one of
-      // the steps fails to go through, it will be released before.
-
-      // inode chain step 1.
-      struct inode *inode = igrab(file->f_inode);
-      if (!inode->i_sb->s_bdev) {
-            iput(inode);
-            return -NOSDEV;
+      struct dentry *dentry = dget(file->f_path.dentry);
+      struct vfsmount *mnt = mntget(file->f_path.mnt);
+      if (!dentry || !dentry->d_inode->i_sb || !dentry->d_inode->i_sb->s_bdev) {
+            return -EINVAL;
       }
-      dev_t dev = inode->i_sb->s_bdev->bd_dev;
 
-      wm.inode = inode;
-      wm.offset = offset;
-      wm.count = count;
+      dev_t dev = dentry->d_inode->i_sb->s_bdev->bd_dev;
 
-      // Record the block that will be overwritten. If the device is not
-      // registered and has no active session it simply won't perform any
-      // action.
-      // Reminder: we support a single block write at a time
-      ret = rcu_compute_on_sdev(dev, &wm, record_block_on_write_callback);
-      if (ret) {
-            // End of inode chain at step 1.
-            iput(inode);
+      // Testing environment check: If a filesystem is mounted on a registered
+      // device that does not use `mount_bdev`, we fall back to session creation
+      // during the first write. NOTE: This slightly violates the project specs
+      // for non-`mount_bdev` cases. To ensure correctness for such other cases,
+      // users MUST avoid registering devices while mounted.
+      if (testing_filesystem) {
+
+            wm.inode = dentry->d_inode;
+            wm.mnt = mnt;
+            wm.offset = *off;
+            wm.count = count;
+
+            // Record the block that will be overwritten. If the device is not
+            // registered and has no active session it simply won't perform any
+            // action.
+            // Reminder: a single block write at a time for the testing
+            // filesystem.
+            ret = rcu_compute_on_sdev(dev, &wm, record_block_on_write_callback);
+            if (!ret) {
+                  out_meta->dev = dev;
+                  out_meta->block = wm.block;
+            }
       } else {
-            out_meta->dev = dev;
-            out_meta->block = wm.out_block;
+            // Session creation fallback: here we check if the device is
+            // registered and has an active session, or has a mapped snapshot
+            // device (for loop devices)
+            ret = try_new_snapshot_session(dentry, mnt);
+            if (!ret) {
+                  log_info("pre_write_handler: Session created at the time of "
+                           "writing.\n",
+                           dev);
+            }
       }
+
+      dput(dentry);
+      mntput(mnt);
 
       return ret;
 }
@@ -1218,13 +1286,13 @@ static int pre_write_handler(struct file *file, loff_t *off, size_t count,
 operation pre handler. It deletes an entry for both the `committed_blocks`
 and the `reading blocks` lists. Finally, it frees the deleted node. */
 static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
-      sector_t block;
+      u64 block;
       snapshot_session *session;
 
       AUDIT DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
 
       session = sdev->session;
-      block = *((sector_t *)arg);
+      block = *((u64 *)arg);
 
       u32 b_hash = hash_block(block);
 
@@ -1249,15 +1317,15 @@ static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
       hlist_del(&sb->rb_hnode);
       spin_unlock(&session->rb_locks[b_hash]);
 
-      // the inode is released during this free.
-      // End of inode chain at step 2.
+      // the vfsmount is released during this free.
+      // End of vfsmount chain at step 2.
       sb_free(sb);
 
       return 0;
 }
 
-static int vfs_write_entry_handler(struct kretprobe_instance *ri,
-                                   struct pt_regs *regs) {
+static int write_entry_handler(struct kretprobe_instance *ri,
+                               struct pt_regs *regs) {
       struct file *file;
       size_t count;
       loff_t *offset;
@@ -1287,8 +1355,8 @@ static int vfs_write_entry_handler(struct kretprobe_instance *ri,
       return 0;
 }
 
-static int vfs_write_ret_handler(struct kretprobe_instance *ri,
-                                 struct pt_regs *regs) {
+static int write_ret_handler(struct kretprobe_instance *ri,
+                             struct pt_regs *regs) {
       ssize_t ret;
       struct write_kretprobe_metadata *meta;
 
@@ -1303,12 +1371,15 @@ static int vfs_write_ret_handler(struct kretprobe_instance *ri,
       meta = (struct write_kretprobe_metadata *)ri->data;
 
       if (ret < 0) {
-            AUDIT log_info("vfs_write_ret_handler: Error writing to block "
-                           "device %d. Rolling back committed block..\n",
+            AUDIT log_info("write_ret_handler: Error writing to block "
+                           "device %u\n",
                            meta->dev);
-            // An error occurred: we must "rollback" what the pre_handler did
-            rcu_compute_on_sdev(meta->dev, (void *)&meta->block,
-                                rollback_write_entry_callback);
+
+            if (testing_filesystem)
+                  // Wwe must "rollback" what the pre_handler
+                  //  did
+                  rcu_compute_on_sdev(meta->dev, (void *)&meta->block,
+                                      rollback_write_entry_callback);
       }
 
       return 0;
@@ -1316,23 +1387,30 @@ static int vfs_write_ret_handler(struct kretprobe_instance *ri,
 
 static struct kretprobe rp_vfs_write = {
     .kp.symbol_name = "vfs_write",
-    .entry_handler = vfs_write_entry_handler,
-    .handler = vfs_write_ret_handler,
+    .entry_handler = write_entry_handler,
+    .handler = write_ret_handler,
     .data_size = sizeof(struct write_kretprobe_metadata),
 };
 
-struct sb_bread_kretprobe_metadata {
-      sector_t block;
+static struct kretprobe rp_kernel_write = {
+    .kp.symbol_name = "kernel_write",
+    .entry_handler = write_entry_handler,
+    .handler = write_ret_handler,
+    .data_size = sizeof(struct write_kretprobe_metadata),
+};
 
-      struct inode *inode;
+struct read_block_metadata {
+      u64 block;
+
+      struct vfsmount *mnt;
       struct dentry *session_dentry;
 };
 
 /* Callback to check if a read block matches the one in `arg`. If so, the caller
-receives the inode of the file whose write triggered the block read and the
-snapshot dentry, both needed for deferred work. */
+receives the vfsmount and the
+snapshot session dentry, both needed for deferred work. */
 static int try_read_block_callback(snap_device *sdev, void *arg) {
-      struct sb_bread_kretprobe_metadata *meta;
+      struct read_block_metadata *meta;
       snapshot_session *session;
 
       if (!sdev) {
@@ -1342,7 +1420,7 @@ static int try_read_block_callback(snap_device *sdev, void *arg) {
             return -SDEVNOTACTIVE;
       }
       session = sdev->session;
-      meta = (struct sb_bread_kretprobe_metadata *)arg;
+      meta = (struct read_block_metadata *)arg;
 
       u32 b_hash = hash_block(meta->block);
 
@@ -1353,17 +1431,17 @@ static int try_read_block_callback(snap_device *sdev, void *arg) {
       hlist_for_each_entry(sb, &session->reading_blocks[b_hash], rb_hnode) {
             if (sb->block == meta->block) {
                   AUDIT log_info("try_read_block_callback: Found reading block "
-                                 "%d for device %s\n",
+                                 "%llu for device %s\n",
                                  sb->block, sdev_name(sdev));
                   hlist_del(&sb->rb_hnode);
                   spin_unlock(&session->rb_locks[b_hash]);
 
-                  // Inform the caller about the inode of the file whose write
-                  // operation triggered this block read.
-                  // inode chain step 3.
-                  meta->inode = sb->inode;
+                  // Inform the caller about the vfsmount of the file whose
+                  // write operation triggered this block read. vfsmount chain
+                  // step 3.
+                  meta->mnt = sb->mnt;
                   // The `snap_block` does not care about the inode anymore.
-                  sb->inode = NULL;
+                  sb->mnt = NULL;
 
                   // Inform the caller also of the snapshot path (needed by the
                   // deferred worker)
@@ -1385,25 +1463,25 @@ static int sb_bread_entry_handler(struct kretprobe_instance *ri,
                                   struct pt_regs *regs) {
 
       struct block_device *bdev;
-      sector_t block;
+      u64 block;
       gfp_t gfp;
-      struct sb_bread_kretprobe_metadata *meta;
+      struct read_block_metadata *meta;
       dev_t dev;
       int ret;
 
 #if defined(CONFIG_X86_64)
       bdev = (struct block_device *)regs->di;
-      block = (sector_t)regs->si;
+      block = (u64)regs->si;
       gfp = (gfp_t)regs->cx;
 #elif defined(CONFIG_ARM64)
       bdev = (struct block_device *)regs->regs[0];
-      block = (sector_t)regs->regs[1];
+      block = (u64)regs->regs[1];
       gfp = (gfp_t)regs->regs[3];
 #else
 #error "Unsupported architecture"
 #endif
 
-      meta = (struct sb_bread_kretprobe_metadata *)ri->data;
+      meta = (struct read_block_metadata *)ri->data;
 
       if (!bdev || gfp != __GFP_MOVABLE) {
             return -1;
@@ -1422,7 +1500,7 @@ static int sb_bread_entry_handler(struct kretprobe_instance *ri,
             return -1;
       }
 
-      AUDIT DEBUG_ASSERT(dev == meta->inode->i_sb->s_bdev->bd_dev);
+      AUDIT DEBUG_ASSERT(dev == meta->mnt->mnt_sb->s_bdev->bd_dev);
 
       // Execute the return handler: copy the read block and defer VFS-related
       // work.
@@ -1433,7 +1511,7 @@ static int sb_bread_entry_handler(struct kretprobe_instance *ri,
 static int sb_bread_ret_handler(struct kretprobe_instance *ri,
                                 struct pt_regs *regs) {
       struct buffer_head *bh;
-      struct sb_bread_kretprobe_metadata *meta;
+      struct read_block_metadata *meta;
       // Log entry used to enqueue the copied block (used in deferred working).
       blog_work *bwork;
       char *bdata;
@@ -1446,42 +1524,42 @@ static int sb_bread_ret_handler(struct kretprobe_instance *ri,
 #error "Unsupported architecture"
 #endif
 
-      meta = (struct sb_bread_kretprobe_metadata *)ri->data;
+      meta = (struct read_block_metadata *)ri->data;
 
       if (!IS_ERR(bh)) {
             // Copy the block
             bdata = kmalloc(bh->b_size, GFP_ATOMIC);
             if (!bdata) {
-                  // End of inode chain at step 3.
-                  iput(meta->inode);
+                  // End of vfsmount chain at step 3.
+                  mntput(meta->mnt);
                   goto out;
             }
             memcpy(bdata, bh->b_data, bh->b_size);
             AUDIT log_info(
-                "sb_bread_ret_handler: Copied block %d from device %d\n",
-                meta->block, meta->inode->i_sb->s_bdev->bd_dev);
+                "sb_bread_ret_handler: Copied block %llu from device %u\n",
+                meta->block, meta->mnt->mnt_sb->s_bdev->bd_dev);
 
             // Enqueue the block log work
             bwork = kmalloc(sizeof(blog_work), GFP_ATOMIC);
             if (!bwork) {
                   kfree(bdata);
-                  // End of inode chain at step 3.
-                  iput(meta->inode);
+                  // End of vfsmount chain at step 3.
+                  mntput(meta->mnt);
                   goto out;
             }
             INIT_BLOG_WORK(bwork, meta->session_dentry, meta->block, bdata,
                            bh->b_size, process_block_log);
 
-            // inode chain step 4.
+            // vfsmount chain step 4.
             // It will be the responsibility of the deferred worker to release
             // it.
-            bwork->inode = meta->inode;
+            bwork->mnt = meta->mnt;
 
             queue_work(block_log_wq, &bwork->work);
 
             AUDIT log_info("sb_bread_ret_handler: Snapshot work queued "
-                           "succesfully for device %d\n",
-                           meta->inode->i_sb->s_bdev->bd_dev);
+                           "succesfully for device %u\n",
+                           meta->mnt->mnt_sb->s_bdev->bd_dev);
       }
 
 out:
@@ -1493,24 +1571,207 @@ static struct kretprobe rp_sb_bread = {
         "__bread_gfp", // we can't probe sb_bread beacuse is an inline function
     .entry_handler = sb_bread_entry_handler,
     .handler = sb_bread_ret_handler,
-    .data_size = sizeof(struct sb_bread_kretprobe_metadata),
+    .data_size = sizeof(struct read_block_metadata),
 };
 
-static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write,
-                                        &rp_sb_bread};
+struct bio_endio_metadata {
+      void *block_data;
+      unsigned int size;
+};
+
+static void read_endio(struct bio *bio) {
+      struct read_block_metadata meta;
+      dev_t dev;
+      struct bio_endio_metadata *bio_meta;
+      blog_work *bwork;
+      int ret;
+
+      bio_meta = (struct bio_endio_metadata *)bio->bi_private;
+
+      if (bio->bi_status)
+            log_err("Read error for device %u, at sector %llu\n",
+                    bio->bi_bdev->bd_dev, bio->bi_iter.bi_sector);
+      else
+            log_info("Read completed for device %u, at sector %llu.\n",
+                     bio->bi_bdev->bd_dev, bio->bi_iter.bi_sector);
+
+      dev = bio->bi_bdev->bd_dev;
+      meta.block = bio->bi_iter.bi_sector;
+
+      ret = rcu_compute_on_sdev(dev, (void *)&meta, try_read_block_callback);
+
+      AUDIT DEBUG_ASSERT(ret == 0);
+      AUDIT DEBUG_ASSERT(dev == meta.mnt->mnt_sb->s_bdev->bd_dev);
+
+      // Enqueue the block log work
+      bwork = kmalloc(sizeof(blog_work), GFP_ATOMIC);
+      if (!bwork) {
+            kfree(bio_meta->block_data);
+            kfree(bio_meta);
+            // End of vfsmount chain at step 3.
+            mntput(meta.mnt);
+            return;
+      }
+      INIT_BLOG_WORK(bwork, meta.session_dentry, meta.block,
+                     (char *)bio_meta->block_data, bio_meta->size,
+                     process_block_log);
+
+      // vfsmount chain step 4.
+      // It will be the responsibility of the deferred worker to release
+      // it.
+      bwork->mnt = meta.mnt;
+
+      queue_work(block_log_wq, &bwork->work);
+
+      kfree(bio_meta);
+      bio_put(bio);
+}
+
+static int read_block_async(struct block_device *bdev, sector_t sector,
+                            struct bio_endio_metadata *bio_meta) {
+      struct bio *bio;
+
+      if (bio_meta->size > PAGE_SIZE) {
+            log_err("Read of more than a page is not currently supported\n");
+            return -EINVAL;
+      }
+
+      bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_NOIO);
+      if (!bio)
+            return -ENOMEM;
+
+      // Configure bio
+      bio->bi_iter.bi_sector = sector;
+      // bio->bi_iter.bi_size = bio_meta->size;
+      bio->bi_end_io = read_endio;
+      bio->bi_private = bio_meta;
+
+      // int i;
+      // unsigned int offset = 0;
+      // for (i = 0; i < nr_blocks; i++) {
+      //       void *block_ptr = bio_meta->block_data + offset;
+      //       log_info("Test 6\n");
+
+      //       if (!bio_add_page(bio, virt_to_page(block_ptr), block_size,
+      //                         offset_in_page(block_ptr))) {
+      //             log_err("Failed to add page to bio\n");
+      //             bio_put(bio);
+      //             return -EIO;
+      //       }
+
+      //       offset += block_size;
+      // }
+
+      if (!bio_add_page(bio, virt_to_page(bio_meta->block_data), bio_meta->size,
+                        offset_in_page(bio_meta->block_data))) {
+            log_err("Failed to add page to bio\n");
+            bio_put(bio);
+            return -EIO;
+      }
+
+      submit_bio(bio);
+
+      log_info(
+          "Submitted read bio for device %u. Sector %llu - Data Size: %u\n",
+          bdev->bd_dev, sector, bio_meta->size);
+
+      return 0;
+}
+
+static int submit_bio_entry_handler(struct kretprobe_instance *ri,
+                                    struct pt_regs *regs) {
+      struct bio *bio;
+      dev_t dev;
+      struct write_metadata wm;
+      int ret;
+
+#if defined(CONFIG_X86_64)
+      bio = (struct bio *)regs->di;
+#elif defined(CONFIG_ARM64)
+      bio = (struct bio *)regs->regs[0];
+#else
+#error "Unsupported architecture"
+#endif
+
+      // Ensure we are not in the testing environment
+      DEBUG_ASSERT(!testing_filesystem);
+
+      // Only intercept WRITE requests (REQ_OP_WRITE = 1)
+      if (bio_op(bio) != REQ_OP_WRITE || !bio->bi_bdev)
+            goto out;
+
+      dev = bio->bi_bdev->bd_dev;
+      wm.block = bio->bi_iter.bi_sector;
+
+      // If device is not registered or has no active session, we simply skip it
+      ret =
+          rcu_compute_on_sdev(dev, (void *)&wm, record_block_on_write_callback);
+
+      if (!ret) {
+            struct bio_endio_metadata *bio_meta =
+                kmalloc(sizeof(struct bio_endio_metadata), GFP_ATOMIC);
+            if (!bio_meta)
+                  goto out;
+
+            unsigned int block_size = bdev_logical_block_size(bio->bi_bdev);
+            unsigned int blocks =
+                max(DIV_ROUND_UP(bio->bi_iter.bi_size, block_size), 1);
+
+            unsigned int total_size = blocks * block_size;
+            void *block_data = kzalloc(total_size, GFP_ATOMIC);
+            if (!block_data) {
+                  kfree(bio_meta);
+                  goto out;
+            }
+
+            bio_meta->block_data = block_data;
+            bio_meta->size = total_size;
+
+            ret = read_block_async(bio->bi_bdev, wm.block, bio_meta);
+            if (ret) {
+                  kfree(bio_meta->block_data);
+                  kfree(bio_meta);
+            }
+      }
+
+out:
+      return -1;
+}
+
+static struct kretprobe rp_submit_bio = {
+    .kp.symbol_name = "submit_bio",
+    .entry_handler = submit_bio_entry_handler,
+};
+
+static struct kretprobe *retprobes[] = {&rp_mount,     &rp_umount,
+                                        &rp_vfs_write, &rp_kernel_write,
+                                        &rp_sb_bread,  &rp_submit_bio};
 
 int register_my_kretprobes(void) {
+
       int i, ret;
+      struct kretprobe *rp;
 
       for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
-            ret = register_kretprobe(retprobes[i]);
+            rp = retprobes[i];
+            if (testing_filesystem && rp->kp.symbol_name == "submit_bio") {
+                  // Skip the submit_bio kretprobe in testing environment
+                  continue;
+            }
+            if (!testing_filesystem && rp->kp.symbol_name == "__bread_gfp") {
+                  // Skip the sb_bread kretprobe with a non testing filesystem
+                  // REMINDER: The probing of `submit_bio` to support other file
+                  // systems is experimental
+                  continue;
+            }
+
+            ret = register_kretprobe(rp);
             if (ret < 0) {
                   log_err("Failed to register kretprobe %s: %d\n",
-                          retprobes[i]->kp.symbol_name, ret);
+                          rp->kp.symbol_name, ret);
                   return ret;
             } else {
-                  log_info("Registered kretprobe %s\n",
-                           retprobes[i]->kp.symbol_name);
+                  log_info("Registered kretprobe %s\n", rp->kp.symbol_name);
             }
       }
 
@@ -1521,6 +1782,16 @@ void unregister_my_kretprobes(void) {
       int i;
 
       for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
+
+            if (testing_filesystem &&
+                retprobes[i]->kp.symbol_name == "submit_bio") {
+                  continue;
+            }
+            if (!testing_filesystem &&
+                retprobes[i]->kp.symbol_name == "__bread_gfp") {
+                  continue;
+            }
+
             unregister_kretprobe(retprobes[i]);
             log_info("Unregistered kretprobe %s\n",
                      retprobes[i]->kp.symbol_name);
@@ -1552,7 +1823,6 @@ int activate_snapshot(const char *dev_name, const char *passwd) {
 
 int deactivate_snapshot(const char *dev_name, const char *passwd) {
 
-      snap_device sdev;
       int error;
 
       // Verifies password

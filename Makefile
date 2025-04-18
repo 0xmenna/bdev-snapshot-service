@@ -38,6 +38,15 @@ define ins_snap_module_all
 		the_snapshot_secret=$$(sudo cat $(PASSWD_PATH))
 endef
 
+
+define ins_snap_module_experimental
+	sudo insmod the_bdev_snapshot.ko \
+		snapshot_ioctl=1 \
+		the_snapshot_secret=$$(sudo cat $(PASSWD_PATH)) \
+		testing_filesystem=0
+endef
+
+
 define ins_module
 	@if [ "$1" = "usctm" ]; then \
 		sudo insmod usctm/the_usctm.ko; \
@@ -47,6 +56,8 @@ define ins_module
 		$(ins_snap_module_ioctl); \
 	elif [ "$1" = "bdev_snapshot_all" ]; then \
 		$(ins_snap_module_all); \
+	elif [ "$1" = "bdev_snapshot_experimental" ]; then \
+		$(ins_snap_module_experimental); \
 	else \
 		sudo insmod tests/singlefile_fs/singlefilefs.ko; \
 	fi
@@ -58,7 +69,13 @@ endef
 
 # -----------------------------------------------------------
 
-test: build_bdev_snapshot build_testing_fs load_bdev_snapshot_ioctl load_testing_fs_driver create_testing_fs
+test: build_bdev_snapshot build_testing_fs load_bdev_snapshot_ioctl load_testing_fs_driver create_testing_fs run_test_singlefilefs unload_testing_fs_driver unload_bdev_snapshot load_bdev_snapshot_experimental run_test_ext4 unload_bdev_snapshot remove_mounting_point
+
+run_test_singlefilefs: 
+	cd tests && sudo python3 snapshot_test.py "singlefilefs"
+
+run_test_ext4:
+	cd tests && sudo python3 snapshot_test.py "ext4"
 
 all: build_usctm build_bdev_snapshot build_testing_fs
 
@@ -102,20 +119,24 @@ load_bdev_snapshot_syscall:
 load_bdev_snapshot_all:
 	$(call ins_module,bdev_snapshot_all)
 
+load_bdev_snapshot_experimental:
+	$(call ins_module,bdev_snapshot_experimental)
+
 unload_usctm:
 	$(call rmm_module,usctm/the_usctm.ko)
 
 unload_bdev_snapshot:
 	$(call rmm_module,the_bdev_snapshot.ko)
+	sudo rm -rf /snapshot
 
 create_testing_fs:
-	dd bs=4096 count=100 if=/dev/zero of=tests/singlefile_fs/image
-	./tests/singlefile_fs/singlefilemakefs tests/singlefile_fs/image
-	mkdir /tmp/mnt
+	dd bs=4096 count=100 if=/dev/zero of=tests/singlefile_fs/sf.img
+	./tests/singlefile_fs/singlefilemakefs tests/singlefile_fs/sf.img
 
-rm_testing_fs:
-	rm -rf /tmp/mnt
-	rm tests/singlefile_fs/image
+	dd bs=4096 count=100 if=/dev/zero of=tests/ext4/ext4.img
+	mkfs.ext4 -b 4096 tests/ext4/ext4.img
+
+	mkdir /tmp/mnt
 
 load_testing_fs_driver:
 	$(call ins_module,singlefile_fs)
@@ -124,8 +145,12 @@ unload_testing_fs_driver:
 	$(call rmm_module,tests/singlefile_fs/singlefilefs.ko)
 
 mount_testing_fs:
-	sudo mount -o loop -t singlefilefs tests/singlefile_fs/image /tmp/mnt
+	sudo mount -o loop -t singlefilefs tests/singlefile_fs/sf.img /tmp/mnt
 
 umount_testing_fs:
 	sudo umount /tmp/mnt
+
+
+remove_mounting_point:
+	sudo rm -rf /tmp/mnt
 

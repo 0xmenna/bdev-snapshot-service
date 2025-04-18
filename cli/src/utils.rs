@@ -2,6 +2,7 @@ use std::{fs, os::raw::c_char};
 
 pub const SUCCESS: i32 = 0;
 const AUTHF: i32 = -104;
+const ACCESSDENIED: i32 = -13;
 
 pub const SNAPSHOT_RECORD_MAGIC: u32 = 0x50414E53;
 
@@ -48,13 +49,33 @@ pub fn log_error(msg: &str) {
     eprintln!("[✗] {msg}");
 }
 
-pub fn log_result(res: i32) {
+pub fn log_result_activation(res: i32) {
     match res {
         SUCCESS => {
             log_success("Snapshot activated successfully.");
         }
         AUTHF => {
             log_error("Authentication failed.");
+        }
+        ACCESSDENIED => {
+            log_error("Access denied.");
+        }
+        _ => {
+            log_error(&format!("Error code: {}", res));
+        }
+    }
+}
+
+pub fn log_result_deactivation(res: i32) {
+    match res {
+        SUCCESS => {
+            log_success("Snapshot deactivated successfully.");
+        }
+        AUTHF => {
+            log_error("Authentication failed.");
+        }
+        ACCESSDENIED => {
+            log_error("Access denied.");
         }
         _ => {
             log_error(&format!("Error code: {}", res));

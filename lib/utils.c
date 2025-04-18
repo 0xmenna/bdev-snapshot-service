@@ -65,15 +65,10 @@ int copy_params_from_user(const char __user *dev_name,
 
 // All file systems that implement the bmap function are supported
 // (https://elixir.bootlin.com/linux/v6.8/source/fs/inode.c#L1771)
-inline int get_block(struct inode *inode, loff_t offset, sector_t *block) {
-      if (!inode->i_mapping->a_ops->bmap) {
-            AUDIT log_err("File system does not implement bmap\n");
-            return -EINVAL;
-      }
+inline int get_block(struct inode *inode, loff_t offset, u64 *block) {
       *block = offset / inode->i_sb->s_blocksize;
-      *block = inode->i_mapping->a_ops->bmap(inode->i_mapping, *block);
 
-      return 0;
+      return bmap(inode, block);
 }
 
 void path_to_safe_name(const char *pathname, char *out_pathname, size_t len) {
@@ -102,7 +97,6 @@ u32 hash_str(const char *str, int bits) {
 int compress_data(struct crypto_comp *comp, const char *data, size_t data_size,
                   struct compressed_data *out) {
 
-      struct compressed_data res;
       int ret;
 
       if (!data || !out)

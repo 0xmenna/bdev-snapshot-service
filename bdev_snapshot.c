@@ -50,10 +50,17 @@ MODULE_PARM_DESC(wq_max_active,
                  "The maximum number of execution contexts per CPU which can "
                  "be assigned to the work items of the workqueue.");
 
+static bool testing_filesystem = true;
+module_param(testing_filesystem, bool, 0660);
+MODULE_PARM_DESC(testing_filesystem,
+                 "Whether the subsystem is configured to work with the testing "
+                 "singlefilefs or a more generic filesystem. WARNING: the "
+                 "generic mode is experimental");
+
 static int __init bdev_snapshot_init(void) {
       int ret;
 
-      init_devices();
+      init_devices(testing_filesystem);
 
       // Initialize the snapshot authentication subsystem
       ret = snapshot_auth_init(the_snapshot_secret);
@@ -92,7 +99,6 @@ static int __init bdev_snapshot_init(void) {
 }
 
 static void __exit bdev_snapshot_exit(void) {
-
       if (the_syscall_table != 0x0)
             uninstall_syscalls(the_syscall_table);
 

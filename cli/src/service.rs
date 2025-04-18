@@ -1,4 +1,4 @@
-use crate::utils::{self, SNAPSHOT_RECORD_MAGIC, SUCCESS};
+use crate::utils::{self, log_info, SNAPSHOT_RECORD_MAGIC, SUCCESS};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -21,7 +21,7 @@ pub fn activate_snapshot(devname: &str, password: &str) {
     utils::log_info(&format!("Activating snapshot for device `{}`...", devname));
     let result = unsafe { utils::sys_activate_snapshot(devname_c.as_ptr(), password_c.as_ptr()) };
 
-    utils::log_result(result);
+    utils::log_result_activation(result);
 }
 
 pub fn deactivate_snapshot(devname: &str, password: &str) {
@@ -44,7 +44,7 @@ pub fn deactivate_snapshot(devname: &str, password: &str) {
     ));
     let result = unsafe { utils::sys_deactivate_snapshot(devname_c.as_ptr(), password_c.as_ptr()) };
 
-    utils::log_result(result);
+    utils::log_result_deactivation(result);
 }
 
 #[repr(C)]
@@ -59,6 +59,8 @@ struct SessionFileHeader {
 struct SnapshotRecordHeader {
     block_number: u64,
     compressed_size: u32,
+    is_compressed: bool,
+    data_size: u32,
     checksum: u32,
 }
 
@@ -99,42 +101,58 @@ pub fn restore_snapshot(dev_name: &str, snapshot_dir: &str) -> std::io::Result<(
             continue;
         }
 
+        log_info(&format!("Block size = {}", session_header.block_size));
+
         loop {
             let mut header_buf = [0u8; std::mem::size_of::<SnapshotRecordHeader>()];
             if file.read_exact(&mut header_buf).is_err() {
-                break;
+                break; // End of file
             }
 
             let header: SnapshotRecordHeader =
                 unsafe { std::ptr::read(header_buf.as_ptr() as *const _) };
 
-            let mut compressed_data = vec![0u8; header.compressed_size as usize];
-            file.read_exact(&mut compressed_data)?;
+            log_info(&format!(
+                "Processing block {}: compressed size = {}, compressed = {}, data size = {}, checksum = {}",
+                header.block_number,
+                header.compressed_size,
+                header.is_compressed,
+                header.data_size,
+                header.checksum
+            ));
 
-            let mut block_data = vec![0u8; session_header.block_size as usize];
-            let mut decompressed_size = 0;
-            let result = unsafe {
-                utils::decompress_deflate(
-                    compressed_data.as_ptr() as *const c_char,
-                    header.compressed_size as usize,
-                    block_data.as_mut_ptr() as *mut c_char,
-                    session_header.block_size as usize,
-                    &mut decompressed_size,
-                )
-            };
+            let mut data = vec![0u8; header.data_size as usize];
 
-            if result != SUCCESS {
-                utils::log_warning(&format!(
-                    "Decompression failed for block {} in `{}`. Skipping.",
-                    header.block_number, file_name
-                ));
-                continue;
+            if header.is_compressed {
+                let mut comp_data = vec![0u8; header.compressed_size as usize];
+                file.read_exact(&mut comp_data)?;
+                let mut decompressed_size = 0;
+
+                let result = unsafe {
+                    utils::decompress_deflate(
+                        comp_data.as_ptr() as *const c_char,
+                        header.compressed_size as usize,
+                        data.as_mut_ptr() as *mut c_char,
+                        header.data_size as usize,
+                        &mut decompressed_size,
+                    )
+                };
+
+                if result != SUCCESS {
+                    utils::log_warning(&format!(
+                        "Decompression failed for block {} in `{}`. Skipping.",
+                        header.block_number, file_name
+                    ));
+                    continue;
+                }
+            } else {
+                file.read_exact(&mut data)?;
             }
 
             let checksum = unsafe {
                 utils::compute_checksum(
-                    block_data.as_ptr() as *const c_char,
-                    session_header.block_size as usize,
+                    data.as_ptr() as *const c_char,
+                    header.data_size as usize,
                     header.block_number as u32,
                 )
             };
@@ -149,7 +167,7 @@ pub fn restore_snapshot(dev_name: &str, snapshot_dir: &str) -> std::io::Result<(
 
             let offset = header.block_number * session_header.block_size as u64;
             dev_file.seek(SeekFrom::Start(offset))?;
-            dev_file.write_all(&block_data)?;
+            dev_file.write_all(&data)?;
         }
 
         utils::log_success(&format!("Snapshot `{}` successfully restored.", file_name));
