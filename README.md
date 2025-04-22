@@ -41,7 +41,7 @@ An in-kernel **character device** at `/dev/snap` allows user interaction via ioc
 
 ## 🧰 Install Dependencies
 
-Before proceeding with tests and manual deployment, make sure your system has the necessary tools installed:
+Before proceeding with the tests and a manual deployment, make sure your system has the necessary tools installed:
 
 ### 1. Filesystem Utilities
 
