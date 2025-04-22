@@ -1,3 +1,4 @@
+#include "../include/scinstall.h"
 #include <linux/module.h>
 
 #ifdef CONFIG_X86
@@ -26,7 +27,6 @@
 #include <linux/version.h>
 #include <linux/wait.h>
 
-#include "../include/scinstall.h"
 #include "../include/scth.h"
 #include "../include/snapshot.h"
 #include "../include/utils.h"

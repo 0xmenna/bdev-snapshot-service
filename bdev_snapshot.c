@@ -73,9 +73,9 @@ static int __init bdev_snapshot_init(void) {
 
       // Initialize the snapshot authentication subsystem
       ret = snapshot_auth_init(the_snapshot_secret);
-      if (ret) {
+      if (ret)
             return ret;
-      }
+
       // Wipe the plain text password
       memzero_explicit(the_snapshot_secret, MAX_SECRET_LEN);
       AUDIT log_info(
@@ -84,22 +84,22 @@ static int __init bdev_snapshot_init(void) {
 
       // Initialize the snapshot directory
       ret = init_snapshot_path();
-      if (ret) {
+      if (ret)
             return ret;
-      }
 
       ret = init_work_queue(wq_max_active);
-      if (ret) {
+      if (ret)
             return ret;
-      }
 
       ret = register_my_kretprobes();
-      if (ret) {
+      if (ret)
             return ret;
-      }
 
-      if (snapshot_ioctl)
+      if (snapshot_ioctl) {
             ret = init_snapshot_control();
+            if (ret)
+                  return ret;
+      }
 
       if (the_syscall_table != 0x0)
             ret = install_syscalls(the_syscall_table);
