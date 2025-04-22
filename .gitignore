@@ -49,9 +49,8 @@ __pycache__/
 # Project related
 usctm/
 
-tests/singlefile_fs/sf.img
-tests/singlefile_fs/backup.img
-tests/ext4/ext4.img
+tests/singlefile_fs/*.img
+tests/ext4/*.img
 
 # Rust related
 cli/target/
