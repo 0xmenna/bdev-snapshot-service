@@ -51,7 +51,7 @@ usctm/
 
 tests/singlefile_fs/sf.img
 tests/singlefile_fs/backup.img
-tests/ext4/*
+tests/ext4/ext4.img
 
 # Rust related
 cli/target/
