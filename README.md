@@ -2,7 +2,7 @@
 
 ![Snapshot Subsystem](media/image.jpg)
 
-This project provides a **Linux kernel module** for managing **block device snapshots**. It allows users to register block devices (e.g., `/dev/sdX`) that host mounted file systems and capture their content in a **Copy-on-Write (CoW)** fashion. The subsystem operates on **mount cycles**, enabling restoration of a device to its **pre-mount state** by preserving only the blocks that have been modified during the mount session.
+This project provides a **Linux kernel module** for managing **block device snapshots**. It allows users to register block devices (e.g., `/dev/sdX`) that host mounted file systems and capture their content in a **Copy-on-Write (CoW)** fashion. The subsystem operates on **mount cycles**, enabling restoration of a device to its **pre-mount state**.
 
 ## Key Features
 
