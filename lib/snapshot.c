@@ -10,24 +10,25 @@ static struct path snapshot_root_path;
 static struct snapshot_devices devices;
 
 /*
- * Two operational modes:
- * 1) TESTING (singlefilefs): Fully spec-compliant, primarely hooks buffer
- * cache. 2) GENERIC (other FS): Experimental - hooks submit_bio at block layer.
- * WARNING: Generic mode may violate a bit the specifications.
+ * Two possible versions:
+ * 1) V1 (works for the testing singlefilefs and other similar FS): Fully
+ * spec-compliant, primarely hooks buffer cache. 2) EXPERIMENTAL_V2 (supports
+ * other FS): Hooks submit_bio at the block layer. WARNING: Experimental version
+ * may violate a bit the specifications.
  */
-static bool testing_filesystem = true;
+static SnapshotVersion version = V1;
 
-/* Per-CPU containers for active snapshot sessions. Each
-    file container (one per cpu) can hold multiple block log entries */
-static DEFINE_PER_CPU(struct hlist_head[1 << DEFAULT_HASH_BITS],
-                      session_containers);
+/* Per-CPU containers for active snapshot sessions. Each file container (one for
+each thread that executes on a cpu) can hold multiple block log entries */
+static DEFINE_PER_CPU(struct snap_containers, session_containers);
 
 /* Workqueue for block log processing */
 static struct workqueue_struct *block_log_wq;
+static int max_percpu_contexts = 1;
 
-inline void init_devices(bool is_testing_fs) {
+inline void init_devices(SnapshotVersion v) {
       INIT_LIST_HEAD(&devices.fdevices);
-      testing_filesystem = is_testing_fs;
+      version = v;
 }
 
 int init_snapshot_path(void) {
@@ -72,7 +73,10 @@ cleanup_root:
       return error;
 }
 
-void put_snapshot_path(void) { path_put(&snapshot_root_path); }
+void put_snapshot_path(void) {
+      path_put(&snapshot_root_path);
+      log_info("Snapshot path released\n");
+}
 
 int init_work_queue(int max_active) {
 
@@ -80,12 +84,16 @@ int init_work_queue(int max_active) {
       if (!block_log_wq) {
             return -ENOMEM;
       }
+      max_percpu_contexts = max_active;
       return 0;
 }
 
 void cleanup_work_queue(void) {
       if (block_log_wq) {
             destroy_workqueue(block_log_wq);
+            flush_workqueue(block_log_wq);
+
+            log_info("block_log_wq destroyed\n");
       }
 }
 
@@ -136,7 +144,7 @@ static inline int lo_backing_file_exists_callback(file_dev_t *fdev, void *arg) {
 /* Removes a device-file from the registered devices. */
 static int remove_fdev_callback(file_dev_t *fdev, void *arg) {
       if (!fdev) {
-            return -NOSDEV;
+            return -NOFDEV;
       }
       if (fdev->is_mapped) {
             // Cannot remove device file because it is mapped to a block
@@ -279,36 +287,33 @@ struct session_dentry_metadata {
 /* Create a new snapshot session directory and get its associated dentry. It is
  used within `rcu_compute_on_sdev`. */
 static int session_dentry_callback(snap_device *sdev, void *arg) {
-      struct tm tm;
-      char date_str[16]; // Format: YYYYMMDD_HHMMSS
       char snap_subdirname[288];
       struct dentry *session_dentry = NULL;
       int ret;
 
-      AUDIT DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
+      DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
 
       struct session_dentry_metadata *session_meta = arg;
+
+      // This is needed to have a single thread creating the session directory
+      mutex_lock(&sdev->session->snap_dir_mtx);
 
       if (d_session(sdev->session)) {
             // Pass the path to the caller
             session_meta->dentry = sdev->session->snap_dentry;
+            mutex_unlock(&sdev->session->snap_dir_mtx);
 
             return 0;
       }
 
-      // Format the timestamp into a date string: YYYYMMDD_HHMMSS
-      time64_to_tm(sdev->session->mount_timestamp, 0, &tm);
-      snprintf(date_str, sizeof(date_str), "%04ld%02d%02d_%02d%02d%02d",
-               tm.tm_year + (long)1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
-               tm.tm_min, tm.tm_sec);
-
-      // Build the snapshot subdirectory name: "<dev_name>_<date_str>"
-      snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%s",
-               sdev_name(sdev), date_str);
+      // Build the snapshot subdirectory name: "<dev_name>_<timestamp>"
+      snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%llu",
+               sdev_name(sdev), sdev->session->mount_timestamp);
 
       // Allocate a new dentry for the subdirectory
       session_dentry = d_alloc_name(snapshot_root_path.dentry, snap_subdirname);
       if (!session_dentry) {
+            mutex_unlock(&sdev->session->snap_dir_mtx);
             return -ENOMEM;
       }
 
@@ -316,38 +321,23 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
       ret = vfs_mkdir(snapshot_root_path.mnt->mnt_idmap,
                       d_inode(snapshot_root_path.dentry), session_dentry, 0660);
       if (ret) {
-            if (ret == -EEXIST) {
-                  // Other threads may have created the directory
-                  ret = SNAPDIR_EXIST;
-            }
             dput(session_dentry);
+            mutex_unlock(&sdev->session->snap_dir_mtx);
 
             return ret;
       }
+      // Assign the new dentry to the session and release the mutex
+      sdev->session->snap_dentry = session_dentry;
+      mutex_unlock(&sdev->session->snap_dir_mtx);
+
       log_info("Created snapshot session directory: %s\n",
                session_dentry->d_name.name);
 
-      // At this point, a single thread will execute this code for a given snap
-      // device session, because the rest have failed to create the directory.
-      snap_device *old_sdev = sdev;
-      snap_device *new_sdev = kmalloc(sizeof(snap_device), GFP_KERNEL);
-      if (!new_sdev) {
-            dput(session_dentry);
-            return -ENOMEM;
-      }
-      memcpy(new_sdev, old_sdev, sizeof(snap_device));
-
-      new_sdev->session->snap_dentry = session_dentry;
-      HLIST_RCU_REPLACE(old_sdev, new_sdev, devices.s_locks,
-                        hash_dev(d_num(new_sdev)));
-
       // Pass the dentry to the caller: it will be the owner
-      session_meta->dentry = new_sdev->session->snap_dentry;
+      session_meta->dentry = session_dentry;
       session_meta->is_owner = true;
 
-      // This is to avoid freeing the session in the callback (since it is used
-      // by the newer snap device)
-      return FREE_SDEV_NO_SESSION;
+      return 0;
 }
 
 /* Create a new snapshot session of a registered snapshot device.
@@ -363,7 +353,7 @@ static int new_session_callback(snap_device *sdev, void *arg) {
             return -NOSDEV;
       }
 
-      AUDIT DEBUG_ASSERT(!sdev->session);
+      DEBUG_ASSERT(!sdev->session);
 
       session = kmalloc(sizeof(snapshot_session), GFP_ATOMIC);
       if (!session) {
@@ -388,31 +378,40 @@ static int new_session_callback(snap_device *sdev, void *arg) {
       return FREE_SDEV;
 }
 
-/* Frees a per-cpu session container. It is executed asyncronously within
+/* Frees per-cpu session containers. It is executed asyncronously within
 `on_each_cpu` function. */
-static void free_percpu_session_container(void *info) {
-      struct hlist_head *containers = this_cpu_ptr(session_containers);
+static void free_percpu_session_containers(void *info) {
+      struct snap_containers *containers = this_cpu_ptr(&session_containers);
       struct dentry *snap_dentry = info;
 
       u32 hash = hash_str(snap_dentry->d_name.name, DEFAULT_HASH_BITS);
 
       struct snap_session_container *entry;
+      struct hlist_node *tmp;
       struct snap_session_container container_lookup = {
           .session_dentry = snap_dentry,
       };
-      hlist_for_each_entry(entry, &containers[hash], hnode) {
-            if (containers_cmp(entry, &container_lookup)) {
-                  AUDIT log_info(
-                      "Freeing session container. CPU: %d. Session: %s\n",
-                      smp_processor_id(), entry->session_dentry->d_name.name);
+
+      // If only one context is allowed to execute per cpu we don't need to sync
+      if (max_percpu_contexts > 1)
+            write_lock(&containers->rw_locks[hash]);
+
+      // Delete all containers with the same session name
+      hlist_for_each_entry_safe(entry, tmp, &containers->hlist[hash], hnode) {
+            if (containers_cmp_session(entry, &container_lookup)) {
 
                   hlist_del(&entry->hnode);
 
                   free_container(entry);
 
-                  return;
+                  // Release a module ref taken during the creation of the
+                  // container
+                  module_put(THIS_MODULE);
             }
       }
+
+      if (max_percpu_contexts > 1)
+            write_unlock(&containers->rw_locks[hash]);
 }
 
 /* Frees a snapshot device and its session */
@@ -434,7 +433,7 @@ static void free_sdev(snap_device *sdev) {
 
             if (session->snap_dentry) {
                   // Ensure async execution
-                  on_each_cpu(free_percpu_session_container,
+                  on_each_cpu(free_percpu_session_containers,
                               (void *)session->snap_dentry, 0);
             }
 
@@ -637,6 +636,7 @@ static int unregister_device(const char *dev_name) {
                            dev.dev, error);
                   return error;
             }
+            log_info("Unregistered Device: Block device %s\n", dev_name);
             break;
 
       case FDEV:
@@ -650,6 +650,7 @@ static int unregister_device(const char *dev_name) {
                       fdev_name(&dev.fdev), error);
                   return error;
             }
+            log_info("Unregistered Device: Loop backing file %s\n", dev_name);
       }
 
       return 0;
@@ -659,14 +660,16 @@ static struct snap_session_container *
 create_snap_container(struct dentry *session_dentry, int cpu,
                       unsigned int block_size, bool is_owner) {
       struct snap_session_container *container = NULL;
-      char container_fname[16];
+      char container_fname[32];
       struct dentry *container_dentry = NULL;
       struct file *filp = NULL;
       int ret;
 
-      snprintf(container_fname, sizeof(container_fname), "snap_c%d", cpu);
+      snprintf(container_fname, sizeof(container_fname), "snap_c%d_%d", cpu,
+               current->pid);
 
       container_dentry = d_alloc_name(session_dentry, container_fname);
+
       if (!container_dentry)
             return ERR_PTR(-ENOMEM);
 
@@ -688,7 +691,7 @@ create_snap_container(struct dentry *session_dentry, int cpu,
             goto out_err;
       }
 
-      container = alloc_session_container(session_dentry, filp);
+      container = alloc_session_container(session_dentry, filp, current->pid);
       if (!container) {
             ret = -ENOMEM;
             goto out_err;
@@ -788,7 +791,7 @@ out:
       return ret;
 }
 
-static int process_block(blog_work *bwork) {
+static int process_block(blog_work *bwork, int cpu) {
       dev_t dev;
       struct dentry *session_dentry;
       bool is_cpu_dentry_owner; // whether the CPU is the creator of the dentry
@@ -796,14 +799,12 @@ static int process_block(blog_work *bwork) {
       unsigned int block_size;
       int ret;
 
-      int cpu = smp_processor_id();
-
       dev = bwork->mnt->mnt_sb->s_bdev->bd_dev;
       session_dentry = bwork->session_dentry;
 
-      AUDIT log_info(
-          "Processing block log work on CPU %d. Device: %u, Block: %llu\n", cpu,
-          dev, bwork->block);
+      AUDIT log_info("Processing block log work on CPU %d. Thread: %d, Device: "
+                     "%u, Block: %llu\n",
+                     cpu, current->pid, dev, bwork->block);
 
       if (!session_dentry) {
             struct session_dentry_metadata session_meta = {
@@ -813,10 +814,6 @@ static int process_block(blog_work *bwork) {
             ret = rcu_compute_on_sdev(dev, (void *)&session_meta,
                                       session_dentry_callback);
             if (ret) {
-                  // If another worker created the snapshot directory
-                  // concurrently, notify the caller to re-schedule the work.
-                  if (ret == SNAPDIR_EXIST)
-                        return RESCHED;
                   return ret;
             }
 
@@ -824,25 +821,41 @@ static int process_block(blog_work *bwork) {
             is_cpu_dentry_owner = session_meta.is_owner;
       }
 
-      struct hlist_head *containers = this_cpu_ptr(session_containers);
+      struct snap_containers *containers = this_cpu_ptr(&session_containers);
       u32 hash = hash_str(session_dentry->d_name.name, DEFAULT_HASH_BITS);
 
+      if (max_percpu_contexts > 1)
+            read_lock(&containers->rw_locks[hash]);
+
       struct snap_session_container *entry;
-      hlist_for_each_entry(entry, &containers[hash], hnode) {
+      hlist_for_each_entry(entry, &containers->hlist[hash], hnode) {
             struct snap_session_container lookup_container = {
                 .session_dentry = session_dentry,
+                .pid = current->pid,
             };
 
             if (containers_cmp(entry, &lookup_container)) {
                   container = entry;
+
+                  if (max_percpu_contexts > 1)
+                        read_unlock(&containers->rw_locks[hash]);
                   goto make_snapshot;
             }
       }
+      if (max_percpu_contexts > 1)
+            read_unlock(&containers->rw_locks[hash]);
 
-      if (testing_filesystem) {
+      switch (version) {
+      case V1:
             block_size = bwork->mnt->mnt_sb->s_blocksize;
-      } else {
+            break;
+      case EXPERIMENTAL_V2:
             block_size = bdev_logical_block_size(bwork->mnt->mnt_sb->s_bdev);
+            break;
+      default:
+            log_err("No other valid versions");
+            DEBUG_ASSERT(false);
+            break;
       }
 
       container = create_snap_container(session_dentry, cpu, block_size,
@@ -852,28 +865,47 @@ static int process_block(blog_work *bwork) {
             if (is_cpu_dentry_owner)
                   dput(session_dentry);
             ret = PTR_ERR(container);
+
             return ret;
       }
 
-      hlist_add_head(&container->hnode, &containers[hash]);
+      // Get a reference to the module after creating the container. This
+      // ensures that the module does not get unloaded until there are cpus that
+      // might still have to free the created containers.
+      ret = try_module_get(THIS_MODULE);
+      // Module should not be unloading because there is at least one active
+      // session device (thus already a module reference)
+      DEBUG_ASSERT(ret);
 
-      log_info("Created new session container on CPU %d. Session: %s. Block "
-               "size: %u\n",
-               cpu, container->session_dentry->d_name.name, block_size);
+      if (max_percpu_contexts > 1)
+            write_lock(&containers->rw_locks[hash]);
+
+      hlist_add_head(&container->hnode, &containers->hlist[hash]);
+
+      if (max_percpu_contexts > 1)
+            write_unlock(&containers->rw_locks[hash]);
+
+      log_err("Created new session container on CPU %d. Thread id: %d. "
+              "Session: %s. Block "
+              "size: %u\n",
+              cpu, current->pid, container->session_dentry->d_name.name,
+              block_size);
 
 make_snapshot:
 
       ret = make_snapshot(session_dentry->d_name.name, container->comp,
                           container->file, bwork->block, bwork->data_size,
                           bwork->orig_data);
+
       if (ret) {
             // No need to free the container since it could be used by later
             // snapshot operations. Free is demanded at the end of the session.
             return ret;
       }
 
-      log_info("Snapshot done. CPU: %d, Session: %s, Block: %llu", cpu,
-               session_dentry->d_name.name, bwork->block);
+      log_info(
+          "Snapshot done. CPU: %d, Thread id: %d, Session: %s, Block: %llu",
+          cpu, current->pid, session_dentry->d_name.name, bwork->block);
 
       return 0;
 }
@@ -884,17 +916,18 @@ static void process_block_log(struct work_struct *work) {
       blog_work *bwork = container_of(work, struct block_log_work, work);
       int ret;
 
-      ret = process_block(bwork);
-      if (ret == RESCHED) {
-            log_info("Rescheduling work. Device: %u, Block: %llu\n",
-                     bwork->mnt->mnt_sb->s_bdev->bd_dev, bwork->block);
+      int cpu = smp_processor_id();
 
-            queue_work(block_log_wq, &bwork->work);
-
-            return;
+      ret = process_block(bwork, cpu);
+      if (ret) {
+            log_err("Error during work processing. CPU: %d, Thread id: %d, "
+                    "Device: %u, Block: %llu. "
+                    "Error: %d\n",
+                    cpu, current->pid, bwork->mnt->mnt_sb->s_bdev->bd_dev,
+                    bwork->block, ret);
       }
 
-      // Final end of inode chain at step 4.
+      // Final end of vfsmount chain at step 4.
       free_blog_work(bwork);
 }
 
@@ -997,21 +1030,19 @@ static int try_new_snapshot_session(struct dentry *dentry,
 static int mount_bdev_ret_handler(struct kretprobe_instance *ri,
                                   struct pt_regs *regs) {
       struct dentry *mnt_dentry;
-      int ret;
 
       mnt_dentry = dget((struct dentry *)regs_return_value(regs));
       if (IS_ERR(mnt_dentry))
-            goto ret_handler;
+            goto out;
 
       if (mnt_dentry->d_sb->s_bdev) {
-            ret = try_new_snapshot_session(mnt_dentry, NULL);
-            if (ret) {
-                  log_err("Error during device %u mounting: %d\n",
-                          mnt_dentry->d_sb->s_bdev->bd_dev, ret);
-            }
+            // Don't care about the error
+            // If the device is not registered it simply won't perform any
+            // action.
+            try_new_snapshot_session(mnt_dentry, NULL);
       }
 
-ret_handler:
+out:
       dput(mnt_dentry);
       return 0;
 }
@@ -1115,7 +1146,6 @@ static struct kretprobe rp_umount = {
     .entry_handler = umount_entry_handler,
     .handler = umount_ret_handler,
     .data_size = sizeof(struct umount_kretprobe_metadata),
-    .maxactive = 20,
 };
 
 struct write_metadata {
@@ -1149,8 +1179,8 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       session = sdev->session;
       wm = (struct write_metadata *)arg;
 
-      mnt = testing_filesystem ? wm->mnt : session->mnt;
-      AUDIT DEBUG_ASSERT(mnt != NULL);
+      mnt = version == V1 ? wm->mnt : session->mnt;
+      DEBUG_ASSERT(mnt != NULL);
 
       // This vfsmount will traverse a chain. If it passes through all steps, it
       // will be released at the end of the deferred working process. If one of
@@ -1159,14 +1189,14 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       // vfsmount chain step 1.
       mnt = mntget(mnt);
 
-      if (testing_filesystem) {
+      if (version == V1) {
             // We simply retrieve the physical block number being overwritten.
-            // Since in many filesystem it can be a blocking function, we only
-            // use it for the testing_fs (which we know is not blocking).
+            // Since in many filesystems it can be a blocking function, be
+            // cautious (for the singlefilefs we know is not blocking).
             int ret = get_block(wm->inode, wm->offset, &wm->block);
             DEBUG_ASSERT(!ret);
       }
-      // If is not a testing filesystem, the block is passed as an argument by
+      // If we are not in V1, the block is passed as an argument by
       // the caller
 
       snap_block = kmalloc(sizeof(struct snap_block), GFP_ATOMIC);
@@ -1213,8 +1243,8 @@ static int record_block_on_write_callback(snap_device *sdev, void *arg) {
       spin_lock(&session->rb_locks[b_hash]);
       // vfsmount chain step 2. The vfsmount is held by the `snap_block` and
       // stored in the reading_blocks. The `snap_block` is also stored in the
-      // committed list, but the lifecycle of the inode is only dependent to the
-      // `rading_blocks` list.
+      // committed list, but the lifecycle of the vfsmount is only dependent to
+      // the `rading_blocks` list.
       hlist_add_head(&snap_block->rb_hnode, &session->reading_blocks[b_hash]);
       spin_unlock(&session->rb_locks[b_hash]);
 
@@ -1242,12 +1272,12 @@ static int pre_write_handler(struct file *file, loff_t *off, size_t count,
 
       dev_t dev = dentry->d_inode->i_sb->s_bdev->bd_dev;
 
-      // Testing environment check: If a filesystem is mounted on a registered
-      // device that does not use `mount_bdev`, we fall back to session creation
-      // during the first write. NOTE: This slightly violates the project specs
-      // for non-`mount_bdev` cases. To ensure correctness for such other cases,
-      // users MUST avoid registering devices while mounted.
-      if (testing_filesystem) {
+      // Versioning check: If a filesystem does not use `mount_bdev`, we fall
+      // back to session creation during the first write. NOTE: This slightly
+      // violates the project specs for non-`mount_bdev` cases. To ensure
+      // correctness for such other cases, users MUST avoid registering devices
+      // while mounted.
+      if (version == V1) {
 
             wm.inode = dentry->d_inode;
             wm.mnt = mnt;
@@ -1257,22 +1287,22 @@ static int pre_write_handler(struct file *file, loff_t *off, size_t count,
             // Record the block that will be overwritten. If the device is not
             // registered and has no active session it simply won't perform any
             // action.
-            // Reminder: a single block write at a time for the testing
-            // filesystem.
+            // NOTE: a single block write at a time is supported.
             ret = rcu_compute_on_sdev(dev, &wm, record_block_on_write_callback);
             if (!ret) {
                   out_meta->dev = dev;
                   out_meta->block = wm.block;
             }
       } else {
+            // EXPERIMENTAL_V2
+
             // Session creation fallback: here we check if the device is
             // registered and has an active session, or has a mapped snapshot
             // device (for loop devices)
             ret = try_new_snapshot_session(dentry, mnt);
             if (!ret) {
                   log_info("pre_write_handler: Session created at the time of "
-                           "writing.\n",
-                           dev);
+                           "writing.\n");
             }
       }
 
@@ -1289,7 +1319,7 @@ static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
       u64 block;
       snapshot_session *session;
 
-      AUDIT DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
+      DEBUG_ASSERT(sdev != NULL && sdev->session != NULL);
 
       session = sdev->session;
       block = *((u64 *)arg);
@@ -1310,7 +1340,7 @@ static int rollback_write_entry_callback(snap_device *sdev, void *arg) {
                   break;
             }
       }
-      AUDIT DEBUG_ASSERT(found);
+      DEBUG_ASSERT(found);
 
       // Remove the block from the reading blocks
       spin_lock(&session->rb_locks[b_hash]);
@@ -1375,8 +1405,8 @@ static int write_ret_handler(struct kretprobe_instance *ri,
                            "device %u\n",
                            meta->dev);
 
-            if (testing_filesystem)
-                  // Wwe must "rollback" what the pre_handler
+            if (version == V1)
+                  // We must "rollback" what the pre_handler
                   //  did
                   rcu_compute_on_sdev(meta->dev, (void *)&meta->block,
                                       rollback_write_entry_callback);
@@ -1500,7 +1530,7 @@ static int sb_bread_entry_handler(struct kretprobe_instance *ri,
             return -1;
       }
 
-      AUDIT DEBUG_ASSERT(dev == meta->mnt->mnt_sb->s_bdev->bd_dev);
+      DEBUG_ASSERT(dev == meta->mnt->mnt_sb->s_bdev->bd_dev);
 
       // Execute the return handler: copy the read block and defer VFS-related
       // work.
@@ -1574,99 +1604,143 @@ static struct kretprobe rp_sb_bread = {
     .data_size = sizeof(struct read_block_metadata),
 };
 
-struct bio_endio_metadata {
-      void *block_data;
+struct read_bio_metadata {
+      struct page **pages;
+      unsigned int nr_pages;
       unsigned int size;
 };
 
 static void read_endio(struct bio *bio) {
       struct read_block_metadata meta;
+      struct read_bio_metadata *bio_meta;
       dev_t dev;
-      struct bio_endio_metadata *bio_meta;
-      blog_work *bwork;
+      unsigned int blocks_per_page, i;
       int ret;
 
-      bio_meta = (struct bio_endio_metadata *)bio->bi_private;
-
-      if (bio->bi_status)
-            log_err("Read error for device %u, at sector %llu\n",
-                    bio->bi_bdev->bd_dev, bio->bi_iter.bi_sector);
-      else
-            log_info("Read completed for device %u, at sector %llu.\n",
-                     bio->bi_bdev->bd_dev, bio->bi_iter.bi_sector);
-
+      bio_meta = bio->bi_private;
       dev = bio->bi_bdev->bd_dev;
-      meta.block = bio->bi_iter.bi_sector;
 
-      ret = rcu_compute_on_sdev(dev, (void *)&meta, try_read_block_callback);
-
-      AUDIT DEBUG_ASSERT(ret == 0);
-      AUDIT DEBUG_ASSERT(dev == meta.mnt->mnt_sb->s_bdev->bd_dev);
-
-      // Enqueue the block log work
-      bwork = kmalloc(sizeof(blog_work), GFP_ATOMIC);
-      if (!bwork) {
-            kfree(bio_meta->block_data);
-            kfree(bio_meta);
-            // End of vfsmount chain at step 3.
-            mntput(meta.mnt);
-            return;
+      if (bio->bi_status) {
+            AUDIT log_err("Read error for device %u, at sector %llu\n", dev,
+                          bio->bi_iter.bi_sector);
+      } else {
+            AUDIT log_info("Read completed for device %u, at sector %llu\n",
+                           dev, bio->bi_iter.bi_sector);
       }
-      INIT_BLOG_WORK(bwork, meta.session_dentry, meta.block,
-                     (char *)bio_meta->block_data, bio_meta->size,
-                     process_block_log);
 
-      // vfsmount chain step 4.
-      // It will be the responsibility of the deferred worker to release
-      // it.
-      bwork->mnt = meta.mnt;
+      meta.block = bio->bi_iter.bi_sector;
+      ret = rcu_compute_on_sdev(dev, &meta, try_read_block_callback);
+      DEBUG_ASSERT(ret == 0);
+      DEBUG_ASSERT(dev == meta.mnt->mnt_sb->s_bdev->bd_dev);
 
-      queue_work(block_log_wq, &bwork->work);
+      const unsigned int block_size = bdev_logical_block_size(bio->bi_bdev);
+      DEBUG_ASSERT(block_size <= PAGE_SIZE);
+      blocks_per_page = PAGE_SIZE / block_size;
 
+      // Allocate a new work for each page
+      blog_work **bworks =
+          kmalloc_array(bio_meta->nr_pages, sizeof(blog_work *), GFP_ATOMIC);
+      if (!bworks)
+            goto cleanup;
+
+      sector_t start_sector = meta.block;
+      unsigned int remaining_size = bio_meta->size;
+      for (i = 0; i < bio_meta->nr_pages && remaining_size > 0; i++) {
+            char *block_data;
+            unsigned int data_size;
+
+            struct page *page = bio_meta->pages[i];
+            sector_t current_sector = start_sector + (i * blocks_per_page);
+
+            bworks[i] = kmalloc(sizeof(blog_work), GFP_ATOMIC);
+            if (!bworks[i]) {
+                  goto cleanup;
+            }
+
+            data_size = min_t(unsigned int, remaining_size, PAGE_SIZE);
+            block_data = kzalloc(data_size, GFP_ATOMIC);
+            if (!block_data) {
+                  goto cleanup;
+            }
+
+            // Copy the page to the `block_data` buffer (used later by the
+            // deferred worker)
+            char *page_buf = kmap_local_page(page);
+            memcpy(block_data, page_buf, data_size);
+            kunmap_local(page_buf);
+
+            // We don't need it anymore
+            __free_page(page);
+
+            INIT_BLOG_WORK(bworks[i], meta.session_dentry, current_sector,
+                           block_data, data_size, process_block_log);
+
+            // vfsmount chain step 4.
+            // It will be the responsibility of the deferred worker to release
+            // it.
+            bworks[i]->mnt = meta.mnt;
+
+            if (i > 0)
+                  // For more than one work we must get another reference
+                  mntget(meta.mnt);
+
+            // Enqueue the block log work
+            queue_work(block_log_wq, &bworks[i]->work);
+
+            remaining_size -= data_size;
+      }
+
+      goto out;
+
+cleanup:
+
+      log_err("read_endio: Memory allocation error\n");
+
+      int j = bio_meta->nr_pages;
+      while (--i >= 0) {
+            kfree(bworks[i]->orig_data);
+            kfree(bworks[i]);
+
+            j--;
+      }
+      while (j-- > 0) {
+            __free_page(bio_meta->pages[bio_meta->nr_pages - j]);
+      }
+
+out:
+      kfree(bworks);
+      kfree(bio_meta->pages);
       kfree(bio_meta);
+
       bio_put(bio);
 }
 
-static int read_block_async(struct block_device *bdev, sector_t sector,
-                            struct bio_endio_metadata *bio_meta) {
+static int submit_read_bio(struct block_device *bdev, sector_t sector,
+                           struct read_bio_metadata *bio_meta) {
       struct bio *bio;
+      int i;
 
-      if (bio_meta->size > PAGE_SIZE) {
-            log_err("Read of more than a page is not currently supported\n");
-            return -EINVAL;
-      }
-
-      bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_NOIO);
-      if (!bio)
+      bio = bio_alloc(bdev, bio_meta->nr_pages, REQ_OP_READ, GFP_ATOMIC);
+      if (!bio) {
+            log_err("Could not allocate bio\n");
             return -ENOMEM;
+      }
 
       // Configure bio
       bio->bi_iter.bi_sector = sector;
-      // bio->bi_iter.bi_size = bio_meta->size;
       bio->bi_end_io = read_endio;
       bio->bi_private = bio_meta;
 
-      // int i;
-      // unsigned int offset = 0;
-      // for (i = 0; i < nr_blocks; i++) {
-      //       void *block_ptr = bio_meta->block_data + offset;
-      //       log_info("Test 6\n");
+      unsigned int remaining = bio_meta->size;
+      for (i = 0; i < bio_meta->nr_pages && remaining > 0; i++) {
+            unsigned int len = min_t(unsigned int, PAGE_SIZE, remaining);
 
-      //       if (!bio_add_page(bio, virt_to_page(block_ptr), block_size,
-      //                         offset_in_page(block_ptr))) {
-      //             log_err("Failed to add page to bio\n");
-      //             bio_put(bio);
-      //             return -EIO;
-      //       }
-
-      //       offset += block_size;
-      // }
-
-      if (!bio_add_page(bio, virt_to_page(bio_meta->block_data), bio_meta->size,
-                        offset_in_page(bio_meta->block_data))) {
-            log_err("Failed to add page to bio\n");
-            bio_put(bio);
-            return -EIO;
+            if (!bio_add_page(bio, bio_meta->pages[i], len, 0)) {
+                  log_err("Failed to add page to bio\n");
+                  bio_put(bio);
+                  return -EIO;
+            }
+            remaining -= len;
       }
 
       submit_bio(bio);
@@ -1678,12 +1752,85 @@ static int read_block_async(struct block_device *bdev, sector_t sector,
       return 0;
 }
 
+static int preprocess_submit_bio(struct bio *bio) {
+      dev_t dev;
+      struct write_metadata wm;
+
+      struct read_bio_metadata *bio_meta = NULL;
+      struct page **pages = NULL;
+      int i = 0;
+
+      int ret;
+
+      // Ensure we are in V2
+      DEBUG_ASSERT(version == EXPERIMENTAL_V2);
+
+      // Only intercept WRITE requests (REQ_OP_WRITE = 1)
+      if (bio_op(bio) != REQ_OP_WRITE || !bio->bi_bdev)
+            return -1;
+
+      dev = bio->bi_bdev->bd_dev;
+      wm.block = bio->bi_iter.bi_sector;
+
+      // If device is not registered or has no active session, we simply skip it
+      ret =
+          rcu_compute_on_sdev(dev, (void *)&wm, record_block_on_write_callback);
+      if (ret)
+            return ret;
+
+      bio_meta = kmalloc(sizeof(struct read_bio_metadata), GFP_ATOMIC);
+      if (!bio_meta)
+            return -ENOMEM;
+
+      unsigned int block_size = bdev_logical_block_size(bio->bi_bdev);
+      unsigned int blocks =
+          max(DIV_ROUND_UP(bio->bi_iter.bi_size, block_size), 1);
+      unsigned int total_size = blocks * block_size;
+
+      // Calculate number of pages needed
+      bio_meta->nr_pages = DIV_ROUND_UP(total_size, PAGE_SIZE);
+      bio_meta->size = total_size;
+
+      // These pages will eventually be freed by the `read_endio` function
+      pages =
+          kmalloc_array(bio_meta->nr_pages, sizeof(struct page *), GFP_ATOMIC);
+      if (!pages) {
+            goto cleanup;
+      }
+
+      for (; i < bio_meta->nr_pages; i++) {
+            pages[i] = alloc_page(GFP_ATOMIC | __GFP_ZERO);
+            if (!pages[i]) {
+                  goto cleanup;
+            }
+      }
+
+      bio_meta->pages = pages;
+
+      // Submit the read request
+      ret = submit_read_bio(bio->bi_bdev, wm.block, bio_meta);
+      if (ret) {
+            goto cleanup;
+      }
+
+      return 0;
+
+cleanup:
+      log_err("Submit bio preprocessing: error in memory allocation");
+      while (--i >= 0)
+            __free_page(pages[i]);
+      if (pages) {
+            kfree(pages);
+      }
+      if (bio_meta) {
+            kfree(bio_meta);
+      }
+      return -ENOMEM;
+}
+
 static int submit_bio_entry_handler(struct kretprobe_instance *ri,
                                     struct pt_regs *regs) {
       struct bio *bio;
-      dev_t dev;
-      struct write_metadata wm;
-      int ret;
 
 #if defined(CONFIG_X86_64)
       bio = (struct bio *)regs->di;
@@ -1693,49 +1840,7 @@ static int submit_bio_entry_handler(struct kretprobe_instance *ri,
 #error "Unsupported architecture"
 #endif
 
-      // Ensure we are not in the testing environment
-      DEBUG_ASSERT(!testing_filesystem);
-
-      // Only intercept WRITE requests (REQ_OP_WRITE = 1)
-      if (bio_op(bio) != REQ_OP_WRITE || !bio->bi_bdev)
-            goto out;
-
-      dev = bio->bi_bdev->bd_dev;
-      wm.block = bio->bi_iter.bi_sector;
-
-      // If device is not registered or has no active session, we simply skip it
-      ret =
-          rcu_compute_on_sdev(dev, (void *)&wm, record_block_on_write_callback);
-
-      if (!ret) {
-            struct bio_endio_metadata *bio_meta =
-                kmalloc(sizeof(struct bio_endio_metadata), GFP_ATOMIC);
-            if (!bio_meta)
-                  goto out;
-
-            unsigned int block_size = bdev_logical_block_size(bio->bi_bdev);
-            unsigned int blocks =
-                max(DIV_ROUND_UP(bio->bi_iter.bi_size, block_size), 1);
-
-            unsigned int total_size = blocks * block_size;
-            void *block_data = kzalloc(total_size, GFP_ATOMIC);
-            if (!block_data) {
-                  kfree(bio_meta);
-                  goto out;
-            }
-
-            bio_meta->block_data = block_data;
-            bio_meta->size = total_size;
-
-            ret = read_block_async(bio->bi_bdev, wm.block, bio_meta);
-            if (ret) {
-                  kfree(bio_meta->block_data);
-                  kfree(bio_meta);
-            }
-      }
-
-out:
-      return -1;
+      return preprocess_submit_bio(bio);
 }
 
 static struct kretprobe rp_submit_bio = {
@@ -1754,12 +1859,12 @@ int register_my_kretprobes(void) {
 
       for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
             rp = retprobes[i];
-            if (testing_filesystem && rp->kp.symbol_name == "submit_bio") {
-                  // Skip the submit_bio kretprobe in testing environment
+            if (version == V1 && rp == &rp_submit_bio) {
+                  // Skip the submit_bio kretprobes in the V1 environment
                   continue;
             }
-            if (!testing_filesystem && rp->kp.symbol_name == "__bread_gfp") {
-                  // Skip the sb_bread kretprobe with a non testing filesystem
+            if (version == EXPERIMENTAL_V2 && rp == &rp_sb_bread) {
+                  // Skip the sb_bread kretprobe in V2
                   // REMINDER: The probing of `submit_bio` to support other file
                   // systems is experimental
                   continue;
@@ -1783,12 +1888,10 @@ void unregister_my_kretprobes(void) {
 
       for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
 
-            if (testing_filesystem &&
-                retprobes[i]->kp.symbol_name == "submit_bio") {
+            if (version == V1 && retprobes[i] == &rp_submit_bio) {
                   continue;
             }
-            if (!testing_filesystem &&
-                retprobes[i]->kp.symbol_name == "__bread_gfp") {
+            if (version == EXPERIMENTAL_V2 && retprobes[i] == &rp_sb_bread) {
                   continue;
             }
 

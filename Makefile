@@ -43,20 +43,21 @@ define ins_snap_module_experimental
 	sudo insmod the_bdev_snapshot.ko \
 		snapshot_ioctl=1 \
 		the_snapshot_secret=$$(sudo cat $(PASSWD_PATH)) \
-		testing_filesystem=0
+		wq_max_active=4 \
+		version=2
 endef
 
 
 define ins_module
 	@if [ "$1" = "usctm" ]; then \
 		sudo insmod usctm/the_usctm.ko; \
-	elif [ "$1" = "bdev_snapshot_syscall" ]; then \
+	elif [ "$1" = "bdev_snapshot_syscall_v1" ]; then \
 		$(ins_snap_module_syscall); \
-	elif [ "$1" = "bdev_snapshot_ioctl" ]; then \
+	elif [ "$1" = "bdev_snapshot_ioctl_v1" ]; then \
 		$(ins_snap_module_ioctl); \
-	elif [ "$1" = "bdev_snapshot_all" ]; then \
+	elif [ "$1" = "bdev_snapshot_all_v1" ]; then \
 		$(ins_snap_module_all); \
-	elif [ "$1" = "bdev_snapshot_experimental" ]; then \
+	elif [ "$1" = "bdev_snapshot_v2" ]; then \
 		$(ins_snap_module_experimental); \
 	else \
 		sudo insmod tests/singlefile_fs/singlefilefs.ko; \
@@ -69,7 +70,9 @@ endef
 
 # -----------------------------------------------------------
 
-test: build_bdev_snapshot build_testing_fs load_bdev_snapshot_ioctl load_testing_fs_driver create_testing_fs run_test_singlefilefs unload_testing_fs_driver unload_bdev_snapshot load_bdev_snapshot_experimental run_test_ext4 unload_bdev_snapshot remove_mounting_point
+test_singlefile_fs: build_bdev_snapshot build_testing_fs load_bdev_snapshot_ioctl_v1 load_testing_fs_driver build_fs_environment run_test_singlefilefs unload_testing_fs_driver unload_bdev_snapshot remove_mount
+
+test_ext4: build_bdev_snapshot load_bdev_snapshot_experimental_v2 build_fs_environment run_test_ext4 unload_bdev_snapshot remove_mount
 
 run_test_singlefilefs: 
 	cd tests && sudo python3 snapshot_test.py "singlefilefs"
@@ -86,7 +89,7 @@ clean:
 	rm -rf usctm
 	rm tests/singlefile_fs/singlefilemakefs
 
-load: load_usctm load_bdev_snapshot_all load_testing_fs_driver
+load: load_usctm load_bdev_snapshot_all_v1 load_testing_fs_driver
 
 unload: unload_testing_fs_driver unload_bdev_snapshot unload_usctm
 
@@ -110,17 +113,17 @@ build_testing_fs:
 load_usctm:
 	$(call ins_module,usctm)
 
-load_bdev_snapshot_ioctl:
-	$(call ins_module,bdev_snapshot_ioctl)
+load_bdev_snapshot_ioctl_v1:
+	$(call ins_module,bdev_snapshot_ioctl_v1)
 
-load_bdev_snapshot_syscall:
-	$(call ins_module,bdev_snapshot_syscall)
+load_bdev_snapshot_syscall_v1:
+	$(call ins_module,bdev_snapshot_syscall_v1)
 
-load_bdev_snapshot_all:
-	$(call ins_module,bdev_snapshot_all)
+load_bdev_snapshot_all_v1:
+	$(call ins_module,bdev_snapshot_all_v1)
 
-load_bdev_snapshot_experimental:
-	$(call ins_module,bdev_snapshot_experimental)
+load_bdev_snapshot_experimental_v2:
+	$(call ins_module,bdev_snapshot_v2)
 
 unload_usctm:
 	$(call rmm_module,usctm/the_usctm.ko)
@@ -129,11 +132,11 @@ unload_bdev_snapshot:
 	$(call rmm_module,the_bdev_snapshot.ko)
 	sudo rm -rf /snapshot
 
-create_testing_fs:
+build_fs_environment:
 	dd bs=4096 count=100 if=/dev/zero of=tests/singlefile_fs/sf.img
 	./tests/singlefile_fs/singlefilemakefs tests/singlefile_fs/sf.img
 
-	dd bs=4096 count=100 if=/dev/zero of=tests/ext4/ext4.img
+	dd bs=1M count=100 if=/dev/zero of=tests/ext4/ext4.img
 	mkfs.ext4 -b 4096 tests/ext4/ext4.img
 
 	mkdir /tmp/mnt
@@ -147,10 +150,12 @@ unload_testing_fs_driver:
 mount_testing_fs:
 	sudo mount -o loop -t singlefilefs tests/singlefile_fs/sf.img /tmp/mnt
 
-umount_testing_fs:
+mount_ext4:
+	sudo mount -o loop -t ext4 tests/ext4/ext4.img /tmp/mnt
+
+umount_fs:
 	sudo umount /tmp/mnt
 
-
-remove_mounting_point:
+remove_mount:
 	sudo rm -rf /tmp/mnt
 

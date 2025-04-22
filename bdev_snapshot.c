@@ -50,17 +50,26 @@ MODULE_PARM_DESC(wq_max_active,
                  "The maximum number of execution contexts per CPU which can "
                  "be assigned to the work items of the workqueue.");
 
-static bool testing_filesystem = true;
-module_param(testing_filesystem, bool, 0660);
-MODULE_PARM_DESC(testing_filesystem,
-                 "Whether the subsystem is configured to work with the testing "
-                 "singlefilefs or a more generic filesystem. WARNING: the "
-                 "generic mode is experimental");
+static int version = V1;
+module_param(version, int, 0660);
+MODULE_PARM_DESC(
+    version,
+    "Subsystem version. "
+    "V1: The subsystem is configured to work well with the testing "
+    "singlefilefs. "
+    "V2: This is experimental and designed to work with other FS as well.");
 
 static int __init bdev_snapshot_init(void) {
       int ret;
 
-      init_devices(testing_filesystem);
+      if (version != V1 && version != EXPERIMENTAL_V2) {
+            log_err("Invalid subsystem version. Supported versions: V1: %d, "
+                    "EXPERIMENTAL_V2: %d\n",
+                    V1, EXPERIMENTAL_V2);
+            return -1;
+      }
+
+      init_devices(version);
 
       // Initialize the snapshot authentication subsystem
       ret = snapshot_auth_init(the_snapshot_secret);

@@ -109,7 +109,7 @@ typedef struct _file_dev {
 static inline void INIT_FDEV(file_dev_t *fdev, struct dentry *dentry,
                              const char *dev_name) {
       int dev_len = strlen(dev_name);
-      AUDIT DEBUG_ASSERT(dev_len < MAX_DEV_LEN);
+      DEBUG_ASSERT(dev_len < MAX_DEV_LEN);
 
       fdev->dentry = dget(dentry);
       strncpy(fdev->dev_name, dev_name, dev_len);
@@ -178,6 +178,7 @@ typedef struct _snapshot_session {
       u64 mount_timestamp;
       struct vfsmount *mnt;
       struct dentry *snap_dentry;
+      struct mutex snap_dir_mtx;
       struct hlist_head reading_blocks[1 << S_BLOCKS_HASH_BITS];
       spinlock_t rb_locks[1 << S_BLOCKS_HASH_BITS];
       struct hlist_head committed_blocks[1 << S_BLOCKS_HASH_BITS];
@@ -190,6 +191,7 @@ static inline void init_snapshot_session(snapshot_session *snap_session,
       snap_session->snap_dentry = NULL;
       snap_session->mnt = mnt;
       snap_session->mount_timestamp = timestamp;
+      mutex_init(&snap_session->snap_dir_mtx);
 }
 
 static inline struct dentry *d_session(snapshot_session *session) {
@@ -199,19 +201,20 @@ static inline struct dentry *d_session(snapshot_session *session) {
 /**
  * struct snap_session_container - Container for session resources
  * @session_dentry:    Dentry identifying the session
- * @comp:             Compression algorithm
+ * @comp:               Compression algorithm
  * @file:              Open file for writing the block log
  * @hnode:             Hash node for lookup
  */
 struct snap_session_container {
       struct dentry *session_dentry;
+      pid_t pid;
       struct crypto_comp *comp;
       struct file *file;
       struct hlist_node hnode;
 };
 
 static inline struct snap_session_container *
-alloc_session_container(struct dentry *dentry, struct file *file) {
+alloc_session_container(struct dentry *dentry, struct file *file, pid_t pid) {
       struct snap_session_container *c;
       struct crypto_comp *comp;
 
@@ -231,6 +234,7 @@ alloc_session_container(struct dentry *dentry, struct file *file) {
       c->session_dentry = dentry;
       c->comp = comp;
       c->file = file;
+      c->pid = pid;
       INIT_HLIST_NODE(&c->hnode);
       return c;
 }
@@ -250,13 +254,27 @@ static inline void free_container(struct snap_session_container *container) {
 
 static inline bool containers_cmp(struct snap_session_container *c1,
                                   struct snap_session_container *c2) {
-      // There cannot be two different valid session dentries with the same name
+      if (strcmp(c1->session_dentry->d_name.name,
+                 c2->session_dentry->d_name.name) == 0 &&
+          c1->pid == c2->pid) {
+            return true;
+      }
+      return false;
+}
+
+static inline bool containers_cmp_session(struct snap_session_container *c1,
+                                          struct snap_session_container *c2) {
       if (strcmp(c1->session_dentry->d_name.name,
                  c2->session_dentry->d_name.name) == 0) {
             return true;
       }
       return false;
 }
+
+struct snap_containers {
+      struct hlist_head hlist[1 << DEFAULT_HASH_BITS];
+      rwlock_t rw_locks[1 << DEFAULT_HASH_BITS];
+};
 
 /**
  * struct _snap_device - Represents a registered snapshot device
@@ -265,8 +283,8 @@ static inline bool containers_cmp(struct snap_session_container *c1,
  * @session:          Associated snapshot session (if any)
  * @hnode:            Hash node
  * @rcu:              RCU callback
- * @private_data:     Optional private data (useful to store the backing dentry
- * for device-files)
+ * @private_data:     Optional private data (useful to store the backing
+ * dentry for device-files)
  */
 typedef struct _snap_device {
       dev_t dev;
@@ -280,7 +298,7 @@ typedef struct _snap_device {
 static inline void INIT_SNAP_DEVICE(snap_device *sdev, dev_t dev,
                                     const char *dev_name) {
       int dev_len = strlen(dev_name);
-      AUDIT DEBUG_ASSERT(dev_len < MAX_DEV_LEN);
+      DEBUG_ASSERT(dev_len < MAX_DEV_LEN);
 
       sdev->dev = dev;
       strncpy(sdev->dev_name, dev_name, dev_len);
@@ -341,16 +359,18 @@ static inline void free_blog_work(blog_work *bwork) {
 
 typedef struct session_header {
       u32 magic;
-      unsigned int block_size;
+      u32 block_size;
 } session_header_t;
 
 typedef struct snapshot_record_header {
       u64 block_number;
-      unsigned int compressed_size;
+      u32 compressed_size;
       bool is_compressed;
-      unsigned int data_size;
+      u32 data_size;
       u32 checksum;
 } snap_record_header_t;
+
+typedef enum { V1 = 1, EXPERIMENTAL_V2 = 2 } SnapshotVersion;
 
 int register_my_kretprobes(void);
 void unregister_my_kretprobes(void);
@@ -358,7 +378,7 @@ void unregister_my_kretprobes(void);
 int init_snapshot_path(void);
 void put_snapshot_path(void);
 
-inline void init_devices(bool is_testing_fs);
+inline void init_devices(SnapshotVersion v);
 
 int init_work_queue(int max_active);
 void cleanup_work_queue(void);

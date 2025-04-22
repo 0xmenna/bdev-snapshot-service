@@ -13,22 +13,35 @@ PASSFILE_PATH = "../the_snapshot_secret"
 SNAPSHOT_DIR = "/snapshot"
 MOUNT_PATH = "/tmp/mnt"
 
-# Paths to the images and backups
+
 IMAGE_PATHS = {
     "ext4": "./ext4/ext4.img",
     "singlefilefs": "./singlefile_fs/sf.img",
 }
 BACKUP_PATHS = {
-    "bfs": "./ext4/backup.img",
+    "ext4": "./ext4/backup.img",
     "singlefilefs": "./singlefile_fs/backup.img",
 }
 
 NUM_THREADS = 4
 
 
-def run_cmd(cmd):
+def run_cmd(cmd, quiet=False):
     print(f"→ {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    if quiet:
+        with open(os.devnull, "w") as devnull:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=devnull,
+                stderr=devnull,
+            )
+    else:
+        subprocess.run(cmd, check=True)
+
+
+def wait_for_log():
+    time.sleep(1.5)
 
 
 def sha256sum(file_path):
@@ -61,7 +74,8 @@ def activate_snapshot(image_path):
             "--passfile",
             PASSFILE_PATH,
             "activate",
-        ]
+        ],
+        quiet=True,
     )
 
 
@@ -74,7 +88,8 @@ def deactivate_snapshot(image_path):
             "--passfile",
             PASSFILE_PATH,
             "deactivate",
-        ]
+        ],
+        quiet=True,
     )
 
 
@@ -97,7 +112,8 @@ def restore_snapshot(image_path, session_path):
             "--session",
             session_path,
             "restore",
-        ]
+        ],
+        quiet=True,
     )
 
 
@@ -110,25 +126,50 @@ def compare_images(original_path, restored_path):
     print("✅ Snapshot successfully restored")
 
 
+def record_file_hashes():
+    """Record SHA256 hashes of all files in the mounted filesystem"""
+    hashes = {}
+    for root, _, files in os.walk(MOUNT_PATH):
+        for file in files:
+            file_path = os.path.join(root, file)
+            hashes[file_path] = sha256sum(file_path)
+    return hashes
+
+
+def verify_file_hashes(original_hashes):
+    """Verify current file hashes match the originally recorded ones"""
+    for file_path, original_hash in original_hashes.items():
+        if not os.path.exists(file_path):
+            print(f"❌ File missing: {file_path}")
+            return False
+
+        current_hash = sha256sum(file_path)
+        if current_hash != original_hash:
+            print(f"❌ Content changed: {file_path}")
+            print(f"  Original: {original_hash}")
+            print(f"  Current:  {current_hash}")
+            return False
+
+    print("✅ All files match their original content")
+    return True
+
+
 # === WRITE OPERATIONS ===
 
 
-def bfs_write():
-    for i in range(5):
-        with open(f"{MOUNT_PATH}/ft_{i}.txt", "w") as f:
-            f.write(f"bfs_data_{i}")
-
+def ext4_write():
     def writer(id):
         for i in range(5):
             with open(f"{MOUNT_PATH}/thread_{id}_{i}", "wb") as f:
-                content = os.urandom(5)
-                # if i % 2 == 0:
-                #     # We avoid base64 encoding every time to keep some data highly random, making compression not effective.
-                #     # This helps test the fallback path where compression is not performed and the original data is copied as-is.
-                #     content = base64.b64encode(content)
+                content = os.urandom(4096 * (i + 1))
+                if i % 2 == 0:
+                    # We avoid base64 encoding every time to keep some data highly random, making compression not effective.
+                    # This helps test the fallback path where compression is not performed and the original data is copied as-is.
+                    content = base64.b64encode(content)
 
                 f.write(content)
-                time.sleep(0.2)
+                f.flush()
+                os.fsync(f.fileno())
 
     threads = [threading.Thread(target=writer, args=(i,)) for i in range(NUM_THREADS)]
     for t in threads:
@@ -140,7 +181,15 @@ def bfs_write():
 def singlefilefs_write():
     target_file = os.path.join(MOUNT_PATH, "the-file")
 
-    def writer(content, offset, length):
+    def writer(i):
+        content = os.urandom(4096)
+        if i % 2 == 0:
+            # We avoid base64 encoding every time to keep some data highly random, making compression not effective.
+            # This helps test the fallback path where compression is not performed and the original data is copied as-is.
+            content = base64.b64encode(content)
+
+        offset = 4096 * i
+
         try:
             fd = os.open(target_file, os.O_RDWR)
         except OSError:
@@ -154,86 +203,123 @@ def singlefilefs_write():
             os.close(fd)
             sys.exit(1)
 
-        data = content
-        to_write = len(data)
+        to_write = len(content)
         while to_write > 0:
             try:
-                ret = os.write(fd, data)
+                ret = os.write(fd, content)
             except OSError:
                 print(f"❌ Error writing to file {target_file}")
                 os.close(fd)
                 sys.exit(1)
 
-            data = data[ret:]
+            content = content[ret:]
             to_write -= ret
 
         os.close(fd)
 
+    # First write consecutive blocks sequentially
     for i in range(5):
-        content = os.urandom(4096)
-        if i % 2 == 0:
-            # We avoid base64 encoding every time to keep some data highly random, making compression not effective.
-            # This helps test the fallback path where compression is not performed and the original data is copied as-is.
-            content = base64.b64encode(content)
+        writer(i)
 
-        writer(content, 4096 * i, len(content))
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(NUM_THREADS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 # === MAIN TEST LOGIC ===
 
 
 def run_test_for_fs(fs_type):
-    print(f"\n\n===== 🔍 Testing {fs_type} filesystem =====")
-    image_path = IMAGE_PATHS[fs_type]
-    backup_path = BACKUP_PATHS[fs_type]
+    try:
+        print(f"\n\n===== 🔍 Testing {fs_type} filesystem =====")
+        image_path = IMAGE_PATHS[fs_type]
+        backup_path = BACKUP_PATHS[fs_type]
 
-    print("🔧 Mounting and populating initial state...")
-    mount_image(image_path, fs_type)
+        print("🔧 Mounting and populating initial state...")
+        wait_for_log()
 
-    if fs_type == "bfs":
-        bfs_write()  # initialization
-    elif fs_type == "singlefilefs":
-        singlefilefs_write()  # initialization
-    else:
-        raise ValueError("Unsupported FS_TYPE")
+        mount_image(image_path, fs_type)
 
-    print("🔧 Unmounting...")
-    umount_image()
+        if fs_type == "ext4":
+            ext4_write()  # initialization
+            # Record file hashes for later comparison
+            original_hashes = record_file_hashes()
+        elif fs_type == "singlefilefs":
+            singlefilefs_write()  # initialization
+        else:
+            raise ValueError("Unsupported FS_TYPE")
 
-    print("📀 Saving image backup...")
-    backup_image(image_path, backup_path)
+        print("🔧 Unmounting...")
+        wait_for_log()
 
-    print("📸 Activating snapshot...")
-    activate_snapshot(image_path)
+        umount_image()
 
-    print("✍️ Remounting and applying MODIFICATIONS...")
-    mount_image(image_path, fs_type)
+        if fs_type == "singlefilefs":
+            print("📀 Saving image backup...")
+            wait_for_log()
 
-    if fs_type == "bfs":
-        bfs_write()
-    elif fs_type == "singlefilefs":
-        singlefilefs_write()
+            backup_image(image_path, backup_path)
 
-    time.sleep(0.5)
+        print("📸 Activating snapshot...")
+        wait_for_log()
 
-    print("🔧 Unmounting...")
-    umount_image()
+        activate_snapshot(image_path)
 
-    print("📸 Deactivating snapshot...")
-    deactivate_snapshot(image_path)
+        print("✍️ Remounting and applying MODIFICATIONS...")
+        wait_for_log()
 
-    print("♻️ Restoring snapshot...")
-    session = find_snapshot_session(image_path)
-    restore_snapshot(image_path, session)
+        mount_image(image_path, fs_type)
 
-    print("🔍 Comparing restored image with backup...")
-    compare_images(backup_path, image_path)
+        if fs_type == "ext4":
+            ext4_write()
+        elif fs_type == "singlefilefs":
+            singlefilefs_write()
+
+        print("🔧 Unmounting...")
+        wait_for_log()
+
+        umount_image()
+
+        print("📸 Deactivating snapshot...")
+        wait_for_log()
+
+        deactivate_snapshot(image_path)
+
+        print("♻️ Restoring snapshot...")
+        wait_for_log()
+
+        session = find_snapshot_session(image_path)
+        restore_snapshot(image_path, session)
+
+        print("🔍 Verifying restore...")
+        wait_for_log()
+
+        if fs_type == "ext4":
+            # Mount and verify file contents
+            mount_image(image_path, fs_type)
+            if not verify_file_hashes(original_hashes):
+                raise AssertionError(
+                    "Snapshot restore verification failed - file hashes don't match!"
+                )
+            umount_image()
+        else:
+            # For singlefilefs, compare images
+            compare_images(backup_path, image_path)
+
+        print(f"\n🎉 Test for {fs_type} filesystem PASSED successfully!")
+
+    except Exception as e:
+        print(f"\n❌❌❌ Test for {fs_type} filesystem FAILED! ❌❌❌")
+        print(f"Reason: {str(e)}")
+        print(f"Exception type: {type(e).__name__}")
 
 
 # === ENTRY POINT ===
 
 if __name__ == "__main__":
-    # Take as input the filesystem type to test
+
     if len(sys.argv) != 2:
         print("Usage: python snapshot_test.py <fs_type>")
         print("fs_type: singlefilefs or bfs")
