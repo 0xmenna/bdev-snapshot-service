@@ -43,13 +43,13 @@ An in-kernel **character device** at `/dev/snap` allows user interaction via ioc
 
 Before proceeding with the tests and a manual deployment, make sure your system has the necessary tools installed:
 
-### 1. Filesystem Utilities
+### 1. Build tools, Filesystem Utilities and the zlib development package
 
-Install `e2fsprogs` to use tools like `mkfs.ext4`:
+Install `e2fsprogs` to use tools like `mkfs.ext4` and the zlib package for compression functions.
 
 ```bash
 sudo apt update
-sudo apt install e2fsprogs
+sudo apt install build-essential e2fsprogs zlib1g-dev
 ```
 
 ### 2. Rust Toolchain
@@ -113,6 +113,8 @@ This test evaluates the experimental V2 snapshot module version, which targets g
 - Lacks taking references of bio's components to prevent unmounting during write operations (not sure it can be done).
 - User must be cautios to when registering, mounting and unmounting the device to avoid issues.
 - On rare cases tests could have an undefined behaviour.
+
+This test has been mainly conducted on an ARM based architecture, therefore the behaviour on x86 can be undefined.
 
 ### Run the Test
 

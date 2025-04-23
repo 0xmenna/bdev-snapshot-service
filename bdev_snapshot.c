@@ -59,6 +59,10 @@ MODULE_PARM_DESC(
     "singlefilefs. "
     "V2: This is experimental and designed to work with other FS as well.");
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+#error "This module requires at least the 6.3.0 kernel version"
+#endif
+
 static int __init bdev_snapshot_init(void) {
       int ret;
 
