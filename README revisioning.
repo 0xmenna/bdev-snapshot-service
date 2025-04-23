@@ -45,11 +45,11 @@ Before proceeding with the tests and a manual deployment, make sure your system 
 
 ### 1. Build tools, Filesystem Utilities and the zlib development package
 
-Install `e2fsprogs` to use tools like `mkfs.ext4` and the zlib package for compression functions.
+Install `e2fsprogs` to use tools like `mkfs.ext4`, the zlib package for compression functions and python for executing tests.
 
 ```bash
 sudo apt update
-sudo apt install build-essential e2fsprogs zlib1g-dev
+sudo apt install build-essential e2fsprogs zlib1g-dev python3
 ```
 
 ### 2. Rust Toolchain
