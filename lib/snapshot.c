@@ -885,7 +885,7 @@ static int process_block(blog_work *bwork, int cpu) {
       if (max_percpu_contexts > 1)
             write_unlock(&containers->rw_locks[hash]);
 
-      log_err("Created new session container on CPU %d. Thread id: %d. "
+      AUDIT log_info("Created new session container on CPU %d. Thread id: %d. "
               "Session: %s. Block "
               "size: %u\n",
               cpu, current->pid, container->session_dentry->d_name.name,

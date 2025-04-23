@@ -151,14 +151,16 @@ make load_bdev_snapshot_ioctl_v1   # Or another variant in the Makefile
 make load_testing_fs_driver
 ```
 
-Unload the modules:
+## 📸 Snapshot management
+
+For serveral commands you will need root priviledges, so execute commands using `sudo`.
+
+Or to ease the overall process just login to your root account by running:
 
 ```bash
-make unload_bdev_snapshot
-make unload_testing_fs_driver
+sudo su
 ```
 
-## 📸 Snapshot management
 
 ### 1. Create Device Files
 
@@ -180,6 +182,7 @@ To activate the snapshot service for a device through the cli tool you can run:
 ```bash
 cd cli
 ./target/debug/cli --dev $PWD/../tests/singlefile_fs/sf.img --passfile ../the_snapshot_secret activate
+cd ..
 ```
 
 ### 3. Mount the Filesystem
@@ -197,8 +200,9 @@ The filesystem is mounted on `/tmp/mnt`. The only file is `the-file`.
 To modify the file, run a simple user space executable in `tests/singlefile_fs/user`:
 
 ```bash
-cd ../tests/singlefile_fs/user
+cd tests/singlefile_fs/user
 ./user /tmp/mnt/the-file 10 "Just some dummy content to modify the singlefile_fs file"
+cd ../../..
 ```
 
 ### 5. Unmount the Filesystem
@@ -206,7 +210,6 @@ cd ../tests/singlefile_fs/user
 By unmounting the filesystem you terminate the snapshot session being created
 
 ```bash
-cd ../../..
 make umount_fs
 ```
 
@@ -227,6 +230,16 @@ For the testing device run:
 
 ```bash
 ./target/debug/cli --dev $PWD/../tests/singlefile_fs/sf.img --passfile ../the_snapshot_secret deactivate
+cd ..
+```
+
+### 7. Unload the Modules
+
+To unload the modules run:
+
+```bash
+make unload_bdev_snapshot
+make unload_testing_fs_driver
 ```
 
 ---
