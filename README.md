@@ -114,7 +114,7 @@ This test evaluates the experimental V2 snapshot module version, which targets g
 - User must be cautios to when registering, mounting and unmounting the device to avoid issues.
 - On rare cases tests could have an undefined behaviour.
 
-This test has been mainly conducted on an ARM based architecture, therefore the behaviour on x86 can be undefined.
+**WARNING**: This test has been mainly conducted on an ARM based architecture.
 
 ### Run the Test
 
