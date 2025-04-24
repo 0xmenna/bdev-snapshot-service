@@ -81,6 +81,8 @@ cd ..  # Return to the root directory
 
 Two main variants of the subsystem exist: a stable V1 version and an experimental V2 version. The V1 is fully spec-compliant and can be tested on the `singlefile_fs` in the tests directory. The V2 aims to support all file systems and comes with some trade-offs and less stability.
 
+To fully test both versions, we recommend using kernel version 6.14.0. Actually, the V1 module version requires a kernel ≥ 6.3.0, but V2 only supports one of the latest versions. For this reason, we suggest using 6.14.0. For an easy setup, Ubuntu 25.04 includes that kernel version by default.
+
 ### 🧪 Test 1: `singlefile_fs`
 
 This test uses a simplified file system (`tests/singlefile_fs`) and targets the stable V1 version of the snapshot module.
@@ -109,12 +111,9 @@ This test evaluates the experimental V2 snapshot module version, which targets g
 
 ### Issues: Future Works
 
-- Early bio submissions before the first `vfs_write` are not captured.
-- Lacks taking references of bio's components to prevent unmounting during write operations (not sure it can be done).
-- User must be cautios to when registering, mounting and unmounting the device to avoid issues.
-- On rare cases tests could have an undefined behaviour.
-
-**WARNING**: This test has been mainly conducted on an ARM based architecture.
+- Early bio submissions before the first vfs_write aren't captured, so we are only able to snapshot vfs related content.
+- Since the session starts with the first write, users need to be cautious when registering and mounting the filesystem.
+- The `submit_bio` kprobe submits an async read for blocks targeted by the write. Even if issued before the write, there's no strict guarantee the read completes first; it depends on BIO scheduling. On latest kernels it works thanks to an efficient scheduling, but this does not hold for older versions.
 
 ### Run the Test
 
@@ -133,7 +132,7 @@ make all
 make load       # Loads the V1 snapshot module version, the singlefile_fs driver and a utility module for the system call table hack (`the_usctm`)
 ```
 
-The loaded snapshot module includes both `syscall` and `ioctl` support.
+The loaded snapshot module includes both `syscall` and `ioctl` support. However, the user library is built with ioctl support in mind (you can change the DEFINE in the library to work with system calls).
 
 ### On both ARM and x86
 
@@ -163,7 +162,6 @@ Or to ease the overall process just login to your root account by running:
 sudo su
 ```
 
-
 ### 1. Create Device Files
 
 To test the manual deployment you can prepare disk image files for both filesystems by running:
@@ -183,7 +181,7 @@ To activate the snapshot service for a device through the cli tool you can run:
 
 ```bash
 cd cli
-./target/debug/cli --dev $PWD/../tests/singlefile_fs/sf.img --passfile ../the_snapshot_secret activate
+./target/debug/cli --dev ../tests/singlefile_fs/sf.img --passfile ../the_snapshot_secret activate
 cd ..
 ```
 
@@ -223,7 +221,7 @@ Then run:
 
 ```bash
 cd cli
-./target/debug/cli --dev $PWD/../tests/singlefile_fs/sf.img --session <session_directory> restore
+./target/debug/cli --dev ../tests/singlefile_fs/sf.img --session <session_directory> restore
 ```
 
 ### 7. Deactivate the Snapshot
@@ -231,7 +229,7 @@ cd cli
 For the testing device run:
 
 ```bash
-./target/debug/cli --dev $PWD/../tests/singlefile_fs/sf.img --passfile ../the_snapshot_secret deactivate
+./target/debug/cli --dev ../tests/singlefile_fs/sf.img --passfile ../the_snapshot_secret deactivate
 cd ..
 ```
 
