@@ -53,7 +53,7 @@ int copy_params_from_user(const char __user *dev_name,
 // of a given file
 inline int get_block(struct inode *inode, loff_t offset, u64 *block);
 
-void path_to_safe_name(const char *pathname, char *out_pathname, size_t len);
+void path_to_safe_name(char *pathname);
 
 u32 compute_checksum(const char *data, size_t size, u32 seed);
 

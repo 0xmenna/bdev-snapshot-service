@@ -8,7 +8,7 @@ struct Args {
     #[arg(value_enum)]
     command: CommandType,
 
-    /// Device name. For block devices, simply provide its name (e.g. sda). For loop devices, specify the pathname associated to the file managed as device-file.
+    /// Device name. Specify the device pathname. For loop devices, specify the pathname associated to the file managed as device-file.
     #[arg(long)]
     dev: String,
 

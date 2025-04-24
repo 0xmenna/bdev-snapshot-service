@@ -71,13 +71,13 @@ inline int get_block(struct inode *inode, loff_t offset, u64 *block) {
       return bmap(inode, block);
 }
 
-void path_to_safe_name(const char *pathname, char *out_pathname, size_t len) {
+void path_to_safe_name(char *pathname) {
       int i;
 
-      for (i = 0; i < len; i++) {
-            out_pathname[i] = (pathname[i] == '/') ? '_' : pathname[i];
-      }
-      out_pathname[len] = '\0';
+      for (i = 0; i < strlen(pathname); i++)
+            pathname[i] = (pathname[i] == '/') ? '_' : pathname[i];
+
+      pathname[i] = '\0';
 }
 
 u32 compute_checksum(const char *data, size_t size, u32 seed) {
@@ -105,7 +105,6 @@ int compress_data(struct crypto_comp *comp, const char *data, size_t data_size,
       ret = crypto_comp_compress(comp, data, data_size, out->data,
                                  (unsigned int *)&out->size);
       if (ret) {
-            AUDIT log_err("Compression failed: %d\n", ret);
             return ret;
       }
 

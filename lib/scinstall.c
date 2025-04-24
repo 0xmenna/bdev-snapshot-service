@@ -101,8 +101,8 @@ int install_syscalls(unsigned long the_syscall_table) {
       new_sys_call_array[0] = (unsigned long)sys_activate_snapshot;
       new_sys_call_array[1] = (unsigned long)sys_deactivate_snapshot;
 
-      ret = get_entries(restore, HACKED_ENTRIES,
-                        (unsigned long *)the_syscall_table, &the_ni_syscall);
+      ret = get_entries(restore, HACKED_ENTRIES, the_syscall_table,
+                        &the_ni_syscall);
 
       if (ret != HACKED_ENTRIES) {
             log_info("Could not hack %d entries (just %d)\n", HACKED_ENTRIES,

@@ -124,6 +124,7 @@ static inline const char *fdev_name(file_dev_t *fdev) { return fdev->dev_name; }
  */
 typedef struct generic_dev {
       enum { BDEV, FDEV } type;
+      char pathname[MAX_DEV_LEN];
       union {
             dev_t dev;
             file_dev_t fdev;
@@ -371,6 +372,8 @@ typedef struct snapshot_record_header {
 } snap_record_header_t;
 
 typedef enum { V1 = 1, EXPERIMENTAL_V2 = 2 } SnapshotVersion;
+
+void preprocess_submit_bio(struct bio *bio);
 
 int register_my_kretprobes(void);
 void unregister_my_kretprobes(void);

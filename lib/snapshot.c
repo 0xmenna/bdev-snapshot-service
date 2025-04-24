@@ -310,6 +310,8 @@ static int session_dentry_callback(snap_device *sdev, void *arg) {
       snprintf(snap_subdirname, sizeof(snap_subdirname), "%s_%llu",
                sdev_name(sdev), sdev->session->mount_timestamp);
 
+      path_to_safe_name(snap_subdirname);
+
       // Allocate a new dentry for the subdirectory
       session_dentry = d_alloc_name(snapshot_root_path.dentry, snap_subdirname);
       if (!session_dentry) {
@@ -499,78 +501,63 @@ static inline bool may_open_device(const struct path *path) {
              !(path->mnt->mnt_sb->s_iflags & SB_I_NODEV);
 }
 
-static int get_dev_by_name(const char *dev_name, generic_dev_t *dev) {
-      char pathname[MAX_DEV_LEN];
+static char *get_dev_by_pathname(const char *pathname, generic_dev_t *dev) {
       struct inode *inode;
       struct path path;
       int error;
 
-      int dev_len = strlen(dev_name);
-      if (dev_len >= MAX_DEV_LEN || dev_len == 0) {
-            return -EINVAL;
-      }
-
-      // Check if the device name is a path
-      if (dev_name[0] != '/') {
-            const char *dev_path = "/dev/";
-            int len = strlen(dev_path) + dev_len;
-            if (len >= MAX_DEV_LEN) {
-                  return -EINVAL;
-            }
-            snprintf(pathname, sizeof(pathname), "%s%s", dev_path, dev_name);
-      } else {
-            snprintf(pathname, sizeof(pathname), "%s", dev_name);
-      }
-
       error = kern_path(pathname, LOOKUP_FOLLOW, &path);
       if (error) {
-            return error;
+            return ERR_PTR(error);
       }
+
+      char *resolved_name = d_path(&path, dev->pathname, MAX_DEV_LEN);
+      if (IS_ERR(resolved_name)) {
+            goto out_path_put;
+      }
+
       inode = d_backing_inode(path.dentry);
       if (!S_ISBLK(inode->i_mode)) {
-            // The provided `dev_name` represents the actual pathname associated
+            // The provided pathname represents the actual pathname associated
             // to the file managed as device-file (used for a loop device).
-            char fdev_name[MAX_DEV_LEN];
-            path_to_safe_name(pathname, fdev_name, strlen(pathname));
             file_dev_t fdev;
-            INIT_FDEV(&fdev, path.dentry, fdev_name);
+            INIT_FDEV(&fdev, path.dentry, resolved_name);
             dev->type = FDEV;
             dev->fdev = fdev;
 
-            error = 0;
             goto out_path_put;
       }
-      error = -EACCES;
-      if (!may_open_device(&path))
+
+      if (!may_open_device(&path)) {
+            resolved_name = ERR_PTR(-EACCES);
             goto out_path_put;
+      }
 
       // An actual block device
       dev->type = BDEV;
       dev->dev = inode->i_rdev;
 
-      error = 0;
 out_path_put:
       path_put(&path);
-      return error;
+      return resolved_name;
 }
 
 static int register_device(const char *dev_name) {
       generic_dev_t dev;
       int error;
+
       // Try to initialize the device
-      error = get_dev_by_name(dev_name, &dev);
-      if (error) {
+      char *resolved_name = get_dev_by_pathname(dev_name, &dev);
+      if (IS_ERR(resolved_name)) {
+            error = PTR_ERR(resolved_name);
             return error;
       }
 
       switch (dev.type) {
       case BDEV:
             snap_device tmp_sdev, *sdev;
-            char safe_name[MAX_DEV_LEN];
 
-            path_to_safe_name(dev_name, safe_name, strlen(dev_name));
-
-            INIT_SNAP_DEVICE(&tmp_sdev, dev.dev, safe_name);
+            INIT_SNAP_DEVICE(&tmp_sdev, dev.dev, resolved_name);
             // Check if the snapshot device is already registered
             error =
                 rcu_compute_on_sdev(d_num(&tmp_sdev), NULL, no_sdev_callback);
@@ -597,7 +584,7 @@ static int register_device(const char *dev_name) {
             if (error) {
                   log_info("Cannot register device: Loop backing file %s "
                            "already registered\n",
-                           dev.fdev.dentry->d_name.name);
+                           dev.fdev.dev_name);
                   dput(dev.fdev.dentry);
                   return error;
             }
@@ -621,8 +608,9 @@ static int unregister_device(const char *dev_name) {
       generic_dev_t dev;
       int error;
 
-      error = get_dev_by_name(dev_name, &dev);
-      if (error) {
+      char *resolved_name = get_dev_by_pathname(dev_name, &dev);
+      if (IS_ERR(resolved_name)) {
+            error = PTR_ERR(resolved_name);
             return error;
       }
 
@@ -636,7 +624,7 @@ static int unregister_device(const char *dev_name) {
                            dev.dev, error);
                   return error;
             }
-            log_info("Unregistered Device: Block device %s\n", dev_name);
+            log_info("Unregistered Device: Block device %s\n", resolved_name);
             break;
 
       case FDEV:
@@ -650,7 +638,8 @@ static int unregister_device(const char *dev_name) {
                       fdev_name(&dev.fdev), error);
                   return error;
             }
-            log_info("Unregistered Device: Loop backing file %s\n", dev_name);
+            log_info("Unregistered Device: Loop backing file %s\n",
+                     resolved_name);
       }
 
       return 0;
@@ -886,10 +875,10 @@ static int process_block(blog_work *bwork, int cpu) {
             write_unlock(&containers->rw_locks[hash]);
 
       AUDIT log_info("Created new session container on CPU %d. Thread id: %d. "
-              "Session: %s. Block "
-              "size: %u\n",
-              cpu, current->pid, container->session_dentry->d_name.name,
-              block_size);
+                     "Session: %s. Block "
+                     "size: %u\n",
+                     cpu, current->pid, container->session_dentry->d_name.name,
+                     block_size);
 
 make_snapshot:
 
@@ -1752,7 +1741,7 @@ static int submit_read_bio(struct block_device *bdev, sector_t sector,
       return 0;
 }
 
-static int preprocess_submit_bio(struct bio *bio) {
+void preprocess_submit_bio(struct bio *bio) {
       dev_t dev;
       struct write_metadata wm;
 
@@ -1767,7 +1756,7 @@ static int preprocess_submit_bio(struct bio *bio) {
 
       // Only intercept WRITE requests (REQ_OP_WRITE = 1)
       if (bio_op(bio) != REQ_OP_WRITE || !bio->bi_bdev)
-            return -1;
+            return;
 
       dev = bio->bi_bdev->bd_dev;
       wm.block = bio->bi_iter.bi_sector;
@@ -1776,11 +1765,11 @@ static int preprocess_submit_bio(struct bio *bio) {
       ret =
           rcu_compute_on_sdev(dev, (void *)&wm, record_block_on_write_callback);
       if (ret)
-            return ret;
+            return;
 
       bio_meta = kmalloc(sizeof(struct read_bio_metadata), GFP_ATOMIC);
       if (!bio_meta)
-            return -ENOMEM;
+            return;
 
       unsigned int block_size = bdev_logical_block_size(bio->bi_bdev);
       unsigned int blocks =
@@ -1813,7 +1802,7 @@ static int preprocess_submit_bio(struct bio *bio) {
             goto cleanup;
       }
 
-      return 0;
+      return;
 
 cleanup:
       log_err("Submit bio preprocessing: error in memory allocation");
@@ -1825,32 +1814,10 @@ cleanup:
       if (bio_meta) {
             kfree(bio_meta);
       }
-      return -ENOMEM;
 }
 
-static int submit_bio_entry_handler(struct kretprobe_instance *ri,
-                                    struct pt_regs *regs) {
-      struct bio *bio;
-
-#if defined(CONFIG_X86_64)
-      bio = (struct bio *)regs->di;
-#elif defined(CONFIG_ARM64)
-      bio = (struct bio *)regs->regs[0];
-#else
-#error "Unsupported architecture"
-#endif
-
-      return preprocess_submit_bio(bio);
-}
-
-static struct kretprobe rp_submit_bio = {
-    .kp.symbol_name = "submit_bio",
-    .entry_handler = submit_bio_entry_handler,
-};
-
-static struct kretprobe *retprobes[] = {&rp_mount,     &rp_umount,
-                                        &rp_vfs_write, &rp_kernel_write,
-                                        &rp_sb_bread,  &rp_submit_bio};
+static struct kretprobe *retprobes[] = {&rp_mount, &rp_umount, &rp_vfs_write,
+                                        &rp_kernel_write, &rp_sb_bread};
 
 int register_my_kretprobes(void) {
 
@@ -1859,25 +1826,19 @@ int register_my_kretprobes(void) {
 
       for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
             rp = retprobes[i];
-            if (version == V1 && rp == &rp_submit_bio) {
-                  // Skip the submit_bio kretprobes in the V1 environment
-                  continue;
-            }
+
             if (version == EXPERIMENTAL_V2 && rp == &rp_sb_bread) {
                   // Skip the sb_bread kretprobe in V2
-                  // REMINDER: The probing of `submit_bio` to support other file
-                  // systems is experimental
                   continue;
             }
 
             ret = register_kretprobe(rp);
-            if (ret < 0) {
+            if (ret) {
                   log_err("Failed to register kretprobe %s: %d\n",
                           rp->kp.symbol_name, ret);
                   return ret;
-            } else {
-                  log_info("Registered kretprobe %s\n", rp->kp.symbol_name);
             }
+            log_info("Registered kretprobe %s\n", rp->kp.symbol_name);
       }
 
       return 0;
@@ -1888,9 +1849,6 @@ void unregister_my_kretprobes(void) {
 
       for (i = 0; i < ARRAY_SIZE(retprobes); i++) {
 
-            if (version == V1 && retprobes[i] == &rp_submit_bio) {
-                  continue;
-            }
             if (version == EXPERIMENTAL_V2 && retprobes[i] == &rp_sb_bread) {
                   continue;
             }
@@ -1906,10 +1864,10 @@ int activate_snapshot(const char *dev_name, const char *passwd) {
 
       // Verifies password
       if (!snapshot_auth_verify(passwd)) {
+            log_err("Authentication failure during device activation\n");
             return -AUTHF;
       }
-      AUDIT log_info("Authentication successful during device %s activation\n",
-                     dev_name);
+
       // Tries to register a new device
       error = register_device(dev_name);
       if (error) {
@@ -1930,11 +1888,9 @@ int deactivate_snapshot(const char *dev_name, const char *passwd) {
 
       // Verifies password
       if (!snapshot_auth_verify(passwd)) {
+            log_err("Authentication failure during device deactivation\n");
             return -AUTHF;
       }
-      AUDIT log_info(
-          "Authentication successful during device %s deactivation\n",
-          dev_name);
 
       // Tries to deallocate the snapshot device
       error = unregister_device(dev_name);

@@ -64,14 +64,8 @@ struct SnapshotRecordHeader {
     checksum: u32,
 }
 
-pub fn restore_snapshot(dev_name: &str, snapshot_dir: &str) -> std::io::Result<()> {
-    let dev_path = if dev_name.starts_with('/') {
-        dev_name.to_string()
-    } else {
-        format!("/dev/{}", dev_name)
-    };
-
-    let mut dev_file = File::options().read(true).write(true).open(&dev_path)?;
+pub fn restore_snapshot(pathname: &str, snapshot_dir: &str) -> std::io::Result<()> {
+    let mut dev_file = File::options().read(true).write(true).open(&pathname)?;
 
     let entries = fs::read_dir(snapshot_dir)?;
     utils::log_info(&format!(

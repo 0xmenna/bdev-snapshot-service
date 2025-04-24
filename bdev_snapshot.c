@@ -63,6 +63,27 @@ MODULE_PARM_DESC(
 #error "This module requires at least the 6.3.0 kernel version"
 #endif
 
+// This kprobe is exploited by the V2 to intercept bio submissions (particularly
+// write requests)
+static struct kprobe kp_submit_bio = {
+    .symbol_name = "submit_bio",
+};
+
+static int submit_bio_handler(struct kprobe *p, struct pt_regs *regs) {
+      struct bio *bio;
+
+#if defined(CONFIG_X86_64)
+      bio = (struct bio *)regs->di;
+#elif defined(CONFIG_ARM64)
+      bio = (struct bio *)regs->regs[0];
+#else
+#error "Unsupported architecture"
+#endif
+
+      preprocess_submit_bio(bio);
+      return 0;
+}
+
 static int __init bdev_snapshot_init(void) {
       int ret;
 
@@ -99,6 +120,16 @@ static int __init bdev_snapshot_init(void) {
       if (ret)
             return ret;
 
+      if (version == EXPERIMENTAL_V2) {
+            kp_submit_bio.pre_handler = submit_bio_handler;
+            ret = register_kprobe(&kp_submit_bio);
+            if (ret) {
+                  log_err("Failed to register submit_bio kprobe\n");
+                  return ret;
+            }
+            log_info("Registered submit_bio kprobe\n");
+      }
+
       if (snapshot_ioctl) {
             ret = init_snapshot_control();
             if (ret)
@@ -117,6 +148,11 @@ static void __exit bdev_snapshot_exit(void) {
 
       if (snapshot_ioctl)
             cleanup_snapshot_control();
+
+      if (version == EXPERIMENTAL_V2) {
+            unregister_kprobe(&kp_submit_bio);
+            log_info("Unregistered submit_bio kprobe\n");
+      }
 
       unregister_my_kretprobes();
 
