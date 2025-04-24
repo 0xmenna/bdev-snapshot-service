@@ -41,7 +41,7 @@ def run_cmd(cmd, quiet=False):
 
 
 def wait_for_log():
-    time.sleep(1.5)
+    time.sleep(2)
 
 
 def sha256sum(file_path):
@@ -300,6 +300,7 @@ def run_test_for_fs(fs_type):
             # Mount and verify file contents
             mount_image(image_path, fs_type)
             if not verify_file_hashes(original_hashes):
+                umount_image()
                 raise AssertionError(
                     "Snapshot restore verification failed - file hashes don't match!"
                 )

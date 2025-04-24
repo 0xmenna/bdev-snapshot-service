@@ -197,7 +197,7 @@ The filesystem is mounted on `/tmp/mnt`. The only file is `the-file`.
 
 ### 4. Perform Writes
 
-To modify the file, run a simple user space executable in `tests/singlefile_fs/user`:
+To modify the file, build and run a simple user space program in `tests/singlefile_fs/user`:
 
 ```bash
 cd tests/singlefile_fs/user
