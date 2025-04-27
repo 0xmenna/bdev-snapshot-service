@@ -17,17 +17,17 @@
 #define DIGEST_SIZE 32
 #define SALT "sntslt"
 #define SALT_SIZE 6
-#define PRE_IMAGE_SIZE DIGEST_SIZE + SALT_SIZE
+#define PRE_IMAGE_SIZE MAX_SECRET_LEN + SALT_SIZE
 
 static u8 passwd_hash[DIGEST_SIZE];
 
 static int derive_passwd_hash(const char *passwd, u8 *out) {
       int ret;
       // Compute preimage = password||salt
-      u8 preimage[PRE_IMAGE_SIZE];
+      u8 preimage[PRE_IMAGE_SIZE] = {0};
 
-      memcpy(preimage, passwd, DIGEST_SIZE);
-      memcpy(preimage + DIGEST_SIZE, SALT, SALT_SIZE);
+      memcpy(preimage, passwd, strlen(passwd));
+      memcpy(preimage + strlen(passwd), SALT, SALT_SIZE);
       // Compute the sha256 digest
       ret = derive_sha256(preimage, PRE_IMAGE_SIZE, out);
       // Wipe the preimage buffer
@@ -58,6 +58,10 @@ bool snapshot_auth_verify(const char *passwd) {
             return false;
       }
 
+      if (strlen(passwd) >= MAX_SECRET_LEN) {
+            return false;
+      }
+
       int ret = derive_passwd_hash(passwd, computed_hash);
       if (ret) {
             AUDIT log_info(
@@ -74,10 +78,7 @@ bool snapshot_auth_verify(const char *passwd) {
 }
 
 int snapshot_auth_init(const char *passwd) {
-      if (strlen(passwd) > MAX_SECRET_LEN - 1) {
-            log_err("Initialization password is too long, size must be a "
-                    "maximum of %d\n",
-                    MAX_SECRET_LEN);
+      if (strlen(passwd) >= MAX_SECRET_LEN) {
             return -EINVAL;
       }
       int ret = derive_passwd_hash(passwd, passwd_hash);
