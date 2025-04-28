@@ -38,6 +38,13 @@ An in-kernel **character device** at `/dev/snap` allows user interaction via ioc
 - **Rust CLI Tool**: A command-line interface that allows:
   - Device snapshot activation and deactivation
   - Restoration of snapshot state
+ 
+## Kernel Version
+
+Two main variants of the subsystem exist: a stable V1 version and an experimental V2 version. The V1 is fully spec-compliant and can be tested on the `singlefile_fs` in the tests directory. The V2 aims to support all file systems and comes with some trade-offs and less stability.
+
+To fully test both versions, we recommend using kernel version 6.14.0. Actually, the V1 module version requires a kernel ≥ 6.3.0, but V2 only supports one of the latest versions. For this reason, we suggest using 6.14.0. For an easy setup, Ubuntu 25.04 includes that kernel version by default.
+
 
 ## 🧰 Install Dependencies
 
@@ -78,10 +85,6 @@ cd ..  # Return to the root directory
 ```
 
 ## ✅ Testing Guide
-
-Two main variants of the subsystem exist: a stable V1 version and an experimental V2 version. The V1 is fully spec-compliant and can be tested on the `singlefile_fs` in the tests directory. The V2 aims to support all file systems and comes with some trade-offs and less stability.
-
-To fully test both versions, we recommend using kernel version 6.14.0. Actually, the V1 module version requires a kernel ≥ 6.3.0, but V2 only supports one of the latest versions. For this reason, we suggest using 6.14.0. For an easy setup, Ubuntu 25.04 includes that kernel version by default.
 
 ### 🧪 Test 1: `singlefile_fs`
 
