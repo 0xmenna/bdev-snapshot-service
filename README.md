@@ -7,7 +7,7 @@ This project provides a **Linux kernel module** for managing **block device snap
 ## Key Features
 
 - Copy-on-Write snapshotting
-- Restore device to its pre-mount state once it gets unmounted (of only modified blocks)
+- Restore device to its pre-mount state once it gets unmounted
 - Supports both **regular block devices** and **loop devices**
 - Dual interface for user interaction: **syscalls** (x86 only) and **ioctl**
 - Tested on both **x86** and **ARM** architectures
@@ -19,7 +19,7 @@ This project provides a **Linux kernel module** for managing **block device snap
 
 From a high level to manage devices within the snapshot subsystem there are two main interfaces:
 
-- `activate_snapshot(char *devname, har *password)`
+- `activate_snapshot(char *devname, Char *password)`
 - `deactivate_snapshot(char *devname, char *password)`
 
 Once the service is active for a device, and the device is mounted, the subsystem creates a new snapshot session and starts to intercept write operations on the mounted file system.
