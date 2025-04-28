@@ -19,7 +19,7 @@ This project provides a **Linux kernel module** for managing **block device snap
 
 From a high level to manage devices within the snapshot subsystem there are two main interfaces:
 
-- `activate_snapshot(char *devname, Char *password)`
+- `activate_snapshot(char *devname, char *password)`
 - `deactivate_snapshot(char *devname, char *password)`
 
 Once the service is active for a device, and the device is mounted, the subsystem creates a new snapshot session and starts to intercept write operations on the mounted file system.
