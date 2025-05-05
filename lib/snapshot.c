@@ -90,8 +90,8 @@ int init_work_queue(int max_active) {
 
 void cleanup_work_queue(void) {
       if (block_log_wq) {
-            destroy_workqueue(block_log_wq);
             flush_workqueue(block_log_wq);
+            destroy_workqueue(block_log_wq);
 
             log_info("block_log_wq destroyed\n");
       }
